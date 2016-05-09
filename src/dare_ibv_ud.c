@@ -379,6 +379,10 @@ ud_qp_create()
     
     /* Attach the QP to a multicast group */
     // saquery -g
+    // Usage: saquery [options] [query-name] [<name> | <lid> | <guid>]
+    // Options:
+    //   --g, -g                 get multicast group info
+
     // casor mgid: ff12:401b:ffff::1
     uint8_t raw[16] = {0xff,0x12,0x40,0x1b,0xff,0xff,0,0,0,0,0,0,0,0,0,0x01};
     //uint8_t raw[16] = {0xff,0x12,0x40,0x1b,0xff,0xff,0,0,0,0,0,0,0xff,0xff,0xff,0xff};
