@@ -6,13 +6,13 @@ Brief: A wait-free direct access protocol that uses RDMA features such as QP dis
 Build DARE
 ----------
 1. Prerequisites
-    - libev (version >= 4.15)
-    - libibverbs (version >= 1.0.0)
+    - libev (apt-get install libev-dev)
+    - libibverbs
 2. ./configure --help
 Script for building DARE
 usage  : $0 [options]
 options: [--prefix=DIR]                # Installation directory
-         [--with-ev=DIR]               # libev installation directory
+         [--with-ev=DIR]               # libev installation directory: /usr/local/
          [--with-ibv=DIR]              # libibverbs installation directory
 3. make
 
