@@ -3,9 +3,12 @@
  *
  * Test code for a client
  *
+ * Copyright (c) 2016 HLRS, University of Stuttgart. All rights reserved.
+ * 
  * Copyright (c) 2014-2015 ETH-Zurich. All rights reserved.
  * 
  * Author(s): Marius Poke <marius.poke@inf.ethz.ch>
+ *            Nakul Vyas <mailnakul@gmail.com>
  * 
  */
 
@@ -23,6 +26,8 @@
 #include <dare_ibv.h>
 #include <dare_kvs_sm.h>
 
+extern char* global_mgid;
+
 void usage( char *prog )
 {
     printf("Usage: %s [OPTIONS]\n"
@@ -33,7 +38,8 @@ void usage( char *prog )
             "\t-s <size>                                (new size)\n"
             "\t-t <trace>                               (trace file)\n"
             "\t-o <output>                              (output file)\n"
-            "\t-l <log>                                 (log file)\n.",
+            "\t-l <log>                                 (log file)\n",
+            "\t-m <mgid>                                (Global Multicast ID)\n.",
             prog);
 }
 
@@ -72,10 +78,11 @@ int main(int argc, char* argv[])
             {"trace", required_argument, 0, 't'},
             {"output", required_argument, 0, 'o'},
             {"log", required_argument, 0, 'l'},
+            {"MGID",required_argument, 0,'m'},
             {0, 0, 0, 0}
         };
         int option_index = 0;
-        c = getopt_long (argc, argv, "hs:t:o:l:p:",
+        c = getopt_long (argc, argv, "hs:m:t:o:l:p:",
                        long_options, &option_index);
         /* Detect the end of the options. */
         if (c == -1) break;
@@ -116,9 +123,15 @@ int main(int argc, char* argv[])
                 break;
 
             case '?':
+                usage(argv[0]);
                 break;
 
+            case 'm':
+                global_mgid = optarg;
+                break;
+  
             default:
+                usage(argv[0]);
                 exit(1);
         }
     }
@@ -153,7 +166,7 @@ int main(int argc, char* argv[])
     
     rc = dare_client_init(&input);
     if (0 != rc) {
-        fprintf(log_fp, "Cannot init client\n");
+        fprintf(input.log, "Cannot init client\n");
         return 1;
     }
     

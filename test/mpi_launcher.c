@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <errno.h>
+#include <sys/wait.h>
 
 #include <mpi.h>
 
@@ -62,7 +63,7 @@ int main(int argc, char** argv)
                     (char *)0 );
         if (rc == -1) printf("Error: %s\n", strerror(errno));
 #endif    
-        return;
+        return 0;
     }
 
     /* Wait for the kernel to finish */

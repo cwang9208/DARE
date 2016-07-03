@@ -3,9 +3,12 @@
  * 
  * Unreliable Datagrams (UD) over InfiniBand
  *
+ * Copyright (c) 2016 HLRS, University of Stuttgart. All rights reserved.
+ * 
  * Copyright (c) 2014-2015 ETH-Zurich. All rights reserved.
  * 
  * Author(s): Marius Poke <marius.poke@inf.ethz.ch>
+ *            Nakul Vyas <mailnakul@gmail.com>
  * 
  */
 
@@ -15,21 +18,24 @@
 #include <unistd.h>
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
- 
+#include<arpa/inet.h>
+
 #include <dare_ibv_ud.h>
 #include <dare_ibv_rc.h>
 #include <dare_ibv.h>
 #include <dare_ep_db.h>
-
 #include <dare_server.h>
 #include <dare_client.h>
 #include <dare_kvs_sm.h>
 #include <timer.h>
-
 extern FILE *log_fp;
 
 /* InfiniBand device */
 extern dare_ib_device_t *dare_ib_device;
+
+/* global_mgid is an IPV6 multicast address */
+char* global_mgid;
+
 #define IBDEV dare_ib_device
 #define SRV_DATA ((dare_server_data_t*)dare_ib_device->udata)
 #define CLT_DATA ((dare_client_data_t*)dare_ib_device->udata)
@@ -44,6 +50,8 @@ static int
 ud_memory_reg();
 static void 
 ud_memory_dereg();
+static int 
+ipv6_string_to_raw(char* ipv6_addr, uint8_t raw[16]);
 static int 
 ud_qp_create();
 static void 
@@ -352,6 +360,36 @@ ud_memory_dereg()
     }
 }
 
+/**
+ * Convert an IPv6 address string to its equivalent binary format -- 
+ * an array of 16 elements of type uint8_t
+ */
+static int 
+ipv6_string_to_raw(char* ipv6_addr, uint8_t raw[16])
+{
+    struct in6_addr result;
+    info(log_fp, "ipv6_addr: [%s]\n", ipv6_addr);
+
+    // Check that a valid IPV6 address has been provide
+    if (!inet_pton(AF_INET6,ipv6_addr,&result)) {
+        error_return(1, log_fp, "inet_pton");
+    }
+
+    // write the result to passed destination array of uint8_t type
+    int i;
+    for(i=0; i<16; i++)
+    raw[i]=(uint8_t)(result.s6_addr[i]);
+
+    //Uncomment the following code to debug without using debugger
+    //printf("\nThe raw address is\n");
+    //for(i=0;i<16;i++)
+    //printf("0x%02x ",raw[i]); 
+    //printf("\n");
+
+    return 0;//success
+}
+
+
 static int 
 ud_qp_create()
 {
@@ -379,13 +417,25 @@ ud_qp_create()
     
     /* Attach the QP to a multicast group */
     // saquery -g
-    // Usage: saquery [options] [query-name] [<name> | <lid> | <guid>]
-    // Options:
-    //   -g get multicast group info
+    
+    uint8_t raw[16]; 
+    if (!global_mgid) {
+        error_return(1, log_fp, "mcast address is NULL\n");
+    }
+    if (ipv6_string_to_raw(global_mgid, raw)) {
+        error_return(1, log_fp, "ipv6_string_to_raw");
+    }
+    info(log_fp, "# mcast addr: [%s]\n", global_mgid);
 
-    // casor mgid: ff12:401b:ffff::1
-    uint8_t raw[16] = {0xff,0x12,0x40,0x1b,0xff,0xff,0,0,0,0,0,0,0,0,0,0x01};
-    //uint8_t raw[16] = {0xff,0x12,0x40,0x1b,0xff,0xff,0,0,0,0,0,0,0xff,0xff,0xff,0xff};
+    //Uncomment the following code to see the contents of raw
+    // printf("\nThe GLOBAL raw address is\n");
+    // int i;
+    // for(i=0;i<16;i++)
+    // printf("0x%02x ",raw[i]);
+    // printf("\n");
+    
+    //printf("\n The Global MGID is set to : % \n", raw);
+   
     memcpy(&(IBDEV->mgid.raw), &raw, sizeof(raw));
     // castor: 0xC003
     // euler: 0xC001
@@ -962,8 +1012,11 @@ handle_one_csm_read_request( struct ibv_wc *wc, client_req_t *request )
 /** 
  * Handle together a set of CSM WRITE requests
  */
+//#define HISTO_BATCHING
+#ifdef HISTO_BATCHING
 int hist[9];
 int total_req;
+#endif
 static uint8_t
 handle_csm_write_requests( struct ibv_wc *write_wcs, uint16_t write_count )
 {
@@ -984,8 +1037,10 @@ handle_csm_write_requests( struct ibv_wc *write_wcs, uint16_t write_count )
         handle_one_csm_write_request(&write_wcs[i], 
             (client_req_t*)(IBDEV->ud_recv_bufs[write_wcs[i].wr_id] + 40));
     }
+#ifdef HISTO_BATCHING
     hist[write_count-1]++;
     total_req++;
+#endif    
 #ifdef WRITE_BENCH    
     if (measure_count == 999) {
         info(log_fp, "Received %"PRIu16" write reqs of %"PRIu32" bytes\n", write_count, write_wcs[0].byte_len - 40);
@@ -1007,14 +1062,19 @@ handle_one_csm_write_request( struct ibv_wc *wc, client_req_t *request )
     most recent request; therefore, a client cannot issue 
     the same write operation twice (not implemented) */
     
+#ifdef HISTO_BATCHING
     static int clt_count = 0;
+#endif    
     
     /* Find the endpoint that send this request */
     dare_ep_t *ep = ep_search(&SRV_DATA->endpoints, wc->slid);
     if (ep ==  NULL) {
         /* No ep with this LID; create a new one */
         ep = ep_insert(&SRV_DATA->endpoints, wc->slid);
-#if 1    
+//info_wtime(log_fp, "New client\n");        
+#ifdef HISTO_BATCHING
+        /* #client++ -> print histogram info for previous number of clients
+         * batching factor of requests */
         if (total_req != 0) {       
             clt_count ++;
             info(log_fp, "#Histo with %d clients (%d)\n", clt_count, total_req);
@@ -1028,6 +1088,7 @@ handle_one_csm_write_request( struct ibv_wc *wc, client_req_t *request )
 #endif 
     }
     ep->ud_ep.qpn = wc->src_qp;
+#ifdef HISTO_BATCHING
     if ( (clt_count == 8) && (total_req == 50000) ) {
         clt_count++;
         info(log_fp, "#Histo with %d clients (%d)\n", clt_count, total_req);
@@ -1038,6 +1099,7 @@ handle_one_csm_write_request( struct ibv_wc *wc, client_req_t *request )
         }
         total_req = 0;
     }
+#endif    
 
     if (ep->last_req_id >= request->hdr.id) {
         /* Already received this request */
@@ -1061,7 +1123,7 @@ handle_one_csm_write_request( struct ibv_wc *wc, client_req_t *request )
 #endif    
     /* Append new entry */  
     SRV_DATA->last_write_csm_idx = log_append_entry(SRV_DATA->log, 
-            SID_GET_TERM(SRV_DATA->cached_sid), request->hdr.id, 
+            SID_GET_TERM(SRV_DATA->ctrl_data->sid), request->hdr.id, 
             wc->slid, CSM, &request->cmd);
 #ifdef WRITE_BENCH   
     if (measure_count == 999) {
@@ -1069,9 +1131,9 @@ handle_one_csm_write_request( struct ibv_wc *wc, client_req_t *request )
             log_offset_end_distance(SRV_DATA->log, prev_end));
     }
     //HRT_GET_TIMESTAMP(SRV_DATA->t1);
-#endif     
-//    info_wtime(log_fp, "NEW LOG ENTRY (RSM OP) with IDX=%"PRIu64"\n", 
-//                   SRV_DATA->last_write_csm_idx);
+#endif
+    //info_wtime(log_fp, "NEW LOG ENTRY (RSM OP) with IDX=%"PRIu64"\n", 
+    //               SRV_DATA->last_write_csm_idx);
 }
 
 /**
@@ -1142,6 +1204,49 @@ handle_message_from_client( struct ibv_wc *wc, ud_hdr_t *ud_hdr )
                 error(log_fp, "Cannot handle RC_ACK msg\n");
                 type = MSG_ERROR;
             }
+            break;
+        }
+        case CSM_READ:
+        {
+            /* Read request from a client */
+            //info(log_fp, ">> Received read request from a client with lid%"
+            //    PRIu16"\n", wc->slid);
+            if (!is_leader()) {
+                /* Ignore request */
+                break;
+            }
+            text_wtime(log_fp, "CLIENT READ REQUEST %"PRIu64" (lid%"PRIu16")\n", 
+                        ud_hdr->id, wc->slid);
+            /* Handle request */
+            handle_one_csm_read_request(wc, (client_req_t*)ud_hdr);
+            break;
+        }
+        case CSM_WRITE:
+        {
+            /* Write request from a client */
+            //info(log_fp, ">> Received write request from a client with lid%"
+            //    PRIu16"\n", wc->slid);
+            if (!is_leader()) {
+                /* Ignore request */
+                break;
+            }
+            text_wtime(log_fp, "CLIENT WRITE REQUEST %"PRIu64" (lid%"PRIu16")\n", 
+                        ud_hdr->id, wc->slid);
+            /* Handle request */
+            handle_one_csm_write_request(wc, (client_req_t*)ud_hdr);
+            break;
+        }
+        case DOWNSIZE:
+        {
+            /* Request for a group downsize */
+            if (!is_leader()) {
+                /* Ignore request */
+                break;
+            }
+            info(log_fp, ">> Received group downsize request from a" 
+                         " client with lid%"PRIu16"\n", wc->slid);
+            /* Handle request */
+            handle_downsize_request(wc, (reconf_req_t*)ud_hdr);
             break;
         }
         case CFG_REPLY:
@@ -1304,14 +1409,14 @@ handle_server_join_request( struct ibv_wc *wc, ud_hdr_t *request )
     new_server->send_flag = 1;
     new_server->send_count = 0;
     SRV_DATA->ctrl_data->vote_ack[empty] = SRV_DATA->log->len;
-    SRV_DATA->ctrl_data->read_offsets[empty] = SRV_DATA->log->head;
+    SRV_DATA->ctrl_data->apply_offsets[empty] = SRV_DATA->log->head;
     
     /* Update request ID for this LID; TODO use protocol SM */
     ep->last_req_id = request->id;
     
     /* Append CONFIG entry */
     ep->cid_idx = log_append_entry(SRV_DATA->log, 
-            SID_GET_TERM(SRV_DATA->cached_sid), request->id, 
+            SID_GET_TERM(SRV_DATA->ctrl_data->sid), request->id, 
             wc->slid, CONFIG, &SRV_DATA->config.cid);
     //INFO_PRINT_LOG(log_fp, SRV_DATA->log);
     info_wtime(log_fp, "Adding CONFIG entry to idx=%"PRIu64"\n", ep->cid_idx);
@@ -1355,11 +1460,16 @@ int ud_exchange_rc_info()
     uint8_t i, j;
     dare_ib_ep_t* ep;
     uint64_t req_id = IBDEV->request_id; // unique REQ ID
-    
+
+    uint32_t numbytes = sizeof(rc_syn_t) +
+        2*get_extended_group_size(SRV_DATA->config)*sizeof(uint32_t);
+    if (mtu_value(IBDEV->mtu) < numbytes) {
+        error_return(1, log_fp, "Cannot send RC INFO via mcast; not enough space\n");
+    }    
     rc_syn_t *request = (rc_syn_t*)IBDEV->ud_send_buf;
     uint32_t *qpns = (uint32_t*)request->data;
     uint32_t len = sizeof(rc_syn_t);
-    
+
     memset(request, 0, len);
     request->hdr.id        = req_id;
     request->hdr.type      = RC_SYN;
@@ -1367,16 +1477,22 @@ int ud_exchange_rc_info()
     request->log_rm.rkey   = IBDEV->lcl_mr[LOG_QP]->rkey;
     request->ctrl_rm.raddr = (uint64_t)SRV_DATA->ctrl_data;
     request->ctrl_rm.rkey  = IBDEV->lcl_mr[CTRL_QP]->rkey;
+    request->mtu           = IBDEV->mtu;
     request->idx           = SRV_DATA->config.idx;
+
+//info(log_fp, "RC SYN: LOG MR=[%"PRIu64"; %"PRIu32"]; LOG MR=[%"PRIu64"; %"PRIu32"]\n",
+//     request->log_rm.raddr, request->log_rm.rkey, request->ctrl_rm.raddr, request->ctrl_rm.rkey);
+   
     
     request->size = get_extended_group_size(SRV_DATA->config);
     for (i = 0, j = 0; i < request->size; i++, j += 2) {
         ep = (dare_ib_ep_t*)SRV_DATA->config.servers[i].ep;
         qpns[j] = ep->rc_ep.rc_qp[LOG_QP].qp->qp_num;
         qpns[j+1] = ep->rc_ep.rc_qp[CTRL_QP].qp->qp_num;
+//info(log_fp, "   [%d] LOG_QPN=%"PRIu32"; CTRL_QPN=%"PRIu32"\n", i, qpns[j], qpns[j+1]);
     }
     len += 2*request->size*sizeof(uint32_t);
-    
+
     //info(log_fp, ">> Sending RC SYN (mcast)\n");
     return mcast_send_message(len);
 }
@@ -1436,21 +1552,44 @@ handle_rc_syn(struct ibv_wc *wc, rc_syn_t *msg)
         ep->rc_ep.rmt_mr[LOG_QP].rkey   = msg->log_rm.rkey;
         ep->rc_ep.rmt_mr[CTRL_QP].raddr = msg->ctrl_rm.raddr;
         ep->rc_ep.rmt_mr[CTRL_QP].rkey  = msg->ctrl_rm.rkey;
-        
+
         /* Set the remote QPNs */
         ep->rc_ep.rc_qp[LOG_QP].qpn = qpns[2*SRV_DATA->config.idx];
         ep->rc_ep.rc_qp[CTRL_QP].qpn = qpns[2*SRV_DATA->config.idx+1];
+        
+        /* Set MTU for this connection */
+        ep->mtu = msg->mtu > IBDEV->mtu ? IBDEV->mtu : msg->mtu;
 
-        /* Connect both QPs 
-         * Note: at start the LOG QP will not be accessible since the PSN
-         * is set to 0 */
+#if 0        
+        info(log_fp, "[%02"PRIu8"]  log: "
+                         "RQPN=%"PRIu32"; "
+                         "RMR=[%"PRIu64"; %"PRIu32"]\n",
+                          msg->idx, 
+                          ep->rc_ep.rc_qp[LOG_QP].qpn, 
+                          ep->rc_ep.rmt_mr[LOG_QP].raddr, 
+                          ep->rc_ep.rmt_mr[LOG_QP].rkey);
+        info(log_fp, "     ctrl: "
+                         "RQPN=%"PRIu32"; "
+                         "RMR=[%"PRIu64"; %"PRIu32"]\n",
+                          ep->rc_ep.rc_qp[CTRL_QP].qpn, 
+                          ep->rc_ep.rmt_mr[CTRL_QP].raddr, 
+                          ep->rc_ep.rmt_mr[CTRL_QP].rkey);
+#endif        
+
+
+        /* Connect CTRL QP */ 
         rc = rc_connect_server(msg->idx, CTRL_QP);
         if (0 != rc) {
             error_return(1, log_fp, "Cannot connect server (CTRL)\n");
         }
-        rc = rc_connect_server(msg->idx, LOG_QP);
-        if (0 != rc) {
-            error_return(1, log_fp, "Cannot connect server (LOG)\n");
+        if (SID_GET_L(SRV_DATA->ctrl_data->sid) && 
+             SID_GET_IDX(SRV_DATA->ctrl_data->sid) == SRV_DATA->config.idx)
+        {
+            /* I'm the leader -- connect LOG QP */ 
+            rc = rc_connect_server(msg->idx, LOG_QP);
+            if (0 != rc) {
+                error_return(1, log_fp, "Cannot connect server (LOG)\n");
+            }
         }
         info_wtime(log_fp, "New connection: #%"PRIu8"\n", msg->idx);
     }    
@@ -1466,6 +1605,7 @@ handle_rc_syn(struct ibv_wc *wc, rc_syn_t *msg)
     reply->log_rm.rkey   = IBDEV->lcl_mr[LOG_QP]->rkey;
     reply->ctrl_rm.raddr = (uint64_t)SRV_DATA->ctrl_data;
     reply->ctrl_rm.rkey  = IBDEV->lcl_mr[CTRL_QP]->rkey;
+    reply->mtu           = IBDEV->mtu;
     reply->idx           = SRV_DATA->config.idx;
     reply->size          = 1;
     qpns[0] = ep->rc_ep.rc_qp[LOG_QP].qp->qp_num;
@@ -1494,6 +1634,7 @@ handle_rc_synack(struct ibv_wc *wc, rc_syn_t *msg)
         /* Configuration inconsistency; it will be solved later */
         return 0;
     }
+
     
     /* Verify if RC already established */
     ep = (dare_ib_ep_t*)SRV_DATA->config.servers[msg->idx].ep;
@@ -1513,19 +1654,40 @@ handle_rc_synack(struct ibv_wc *wc, rc_syn_t *msg)
         ep->rc_ep.rc_qp[LOG_QP].qpn    = qpns[0];
         ep->rc_ep.rc_qp[CTRL_QP].qpn   = qpns[1];
         
+        /* Set MTU for this connection */
+        ep->mtu = msg->mtu > IBDEV->mtu ? IBDEV->mtu : msg->mtu;
+        
         /* Mark RC established */
         ep->rc_connected = 1;
+#if 0
+        info(log_fp, "[%02"PRIu8"]  log: "
+                         "RQPN=%"PRIu32"; "
+                         "RMR=[%"PRIu64"; %"PRIu32"]\n",
+                          msg->idx, 
+                          ep->rc_ep.rc_qp[LOG_QP].qpn, 
+                          ep->rc_ep.rmt_mr[LOG_QP].raddr, 
+                          ep->rc_ep.rmt_mr[LOG_QP].rkey);
+        info(log_fp, "     ctrl: "
+                         "RQPN=%"PRIu32"; "
+                         "RMR=[%"PRIu64"; %"PRIu32"]\n",
+                          ep->rc_ep.rc_qp[CTRL_QP].qpn, 
+                          ep->rc_ep.rmt_mr[CTRL_QP].raddr, 
+                          ep->rc_ep.rmt_mr[CTRL_QP].rkey);
+#endif 
 
-        /* Connect both QPs 
-         * Note: at start the LOG QP will not be accessible since the QPN 
-         * is set to 0 */
+        /* Connect only CTRL QP */ 
         rc = rc_connect_server(msg->idx, CTRL_QP);
         if (0 != rc) {
             error_return(1, log_fp, "Cannot connect server (CTRL)\n");
         }
-        rc = rc_connect_server(msg->idx, LOG_QP);
-        if (0 != rc) {
-            error_return(1, log_fp, "Cannot connect server (LOG)\n");
+        if (SID_GET_L(SRV_DATA->ctrl_data->sid) && 
+             SID_GET_IDX(SRV_DATA->ctrl_data->sid) == SRV_DATA->config.idx)
+        {
+            /* I'm the leader -- connect LOG QP */ 
+            rc = rc_connect_server(msg->idx, LOG_QP);
+            if (0 != rc) {
+                error_return(1, log_fp, "Cannot connect server (LOG)\n");
+            }
         }
         info_wtime(log_fp, "New connection: #%"PRIu8"\n", msg->idx);
 
@@ -2087,7 +2249,7 @@ handle_downsize_request(struct ibv_wc *wc, reconf_req_t *request)
         SRV_DATA->config.clt_id = wc->slid;
         PRINT_CONF_TRANSIT(old_cid, SRV_DATA->config.cid);
         /* Append CONFIG entry */
-        log_append_entry(SRV_DATA->log, SID_GET_TERM(SRV_DATA->cached_sid), 
+        log_append_entry(SRV_DATA->log, SID_GET_TERM(SRV_DATA->ctrl_data->sid), 
                 request->hdr.id, wc->slid, CONFIG, &SRV_DATA->config.cid);
         return;
     }

@@ -93,7 +93,8 @@ struct server_t {
     uint8_t send_flag;      // flag set for posting send for this EP
     uint8_t send_count;     // number of sends poster for current step
 };
-typedef struct server_t server_t;
+
+//typedef struct server_t server_t;
 
 struct vote_req_t {
     uint64_t sid;
@@ -131,7 +132,7 @@ struct ctrl_data_t {
     uint64_t 	  hb[MAX_SERVER_COUNT];             /* heartbeat array */ 
     uint64_t      vote_ack[MAX_SERVER_COUNT];
     uint64_t      rsid[MAX_SERVER_COUNT];   /* for remote terms & indexes */
-    uint64_t      read_offsets[MAX_SERVER_COUNT];   /* read offsets */
+    uint64_t      apply_offsets[MAX_SERVER_COUNT];   /* apply offsets */
     
     /* Remote private data */
     prv_data_t  prv_data[MAX_SERVER_COUNT];    // private data
@@ -161,7 +162,6 @@ typedef struct dare_loggp_t dare_loggp_t;
 
 struct dare_server_data_t {
     dare_server_input_t *input;
-    uint64_t cached_sid;    // private copy of own SID
     
     server_config_t config; // configuration 
     
@@ -187,7 +187,7 @@ typedef struct dare_server_data_t dare_server_data_t;
 int dare_server_init( dare_server_input_t *input );
 void dare_server_shutdown();
 
-void server_sid_modified();
+void server_to_follower();
 int server_update_sid( uint64_t new_sid, uint64_t old_sid );
 int is_leader();
 

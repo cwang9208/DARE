@@ -1,3 +1,6 @@
+Copyright (c) 2016 HLRS, University of Stuttgart. 
+	 All rights reserved.
+
 Copyright (c) 2014-2015 ETH - Eidgenössische Technische Hochschule Zürich
     Scalable and Parallel Computing Lab - (http://spcl.inf.ethz.ch/)
 	 All rights reserved.
@@ -45,6 +48,6 @@ following citation:
 
 ----------------------------------------------------------------------
 M. Poke, T. Hoefler: DARE: High-Performance State Machine Replication on 
-RDMA Networks . In Proceedings of the 24th ACM International Symposium 
+RDMA Networks. In Proceedings of the 24th ACM International Symposium 
 on High-Performance Parallel and Distributed Computing (HPDC’15)
 ----------------------------------------------------------------------

@@ -76,7 +76,7 @@ typedef struct server_config_t server_config_t;
 
 /* Get the maximum size including the extra added servers */
 static uint8_t
-get_extended_group_size(server_config_t config)
+get_extended_group_size( server_config_t config )
 {
     if (CID_STABLE == config.cid.state)
         return config.cid.size[0];

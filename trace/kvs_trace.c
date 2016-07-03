@@ -21,7 +21,7 @@
 #define LOOP_COUNT 5
 //#define MIN_DATA_LEN 8
 #define MIN_DATA_LEN 8
-#define MAX_DATA_LEN 2048
+#define MAX_DATA_LEN 1024
 
 void usage( char *prog )
 {

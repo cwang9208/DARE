@@ -41,7 +41,6 @@ const double retransmit_period = 0.04;
 const double rc_info_period = 0.05;
 const double log_pruning_period = 0.05;
 #else
-//const double hb_period = 0.1;
 const double hb_period = 0.001;
 const uint64_t elec_timeout_low = 10000;
 const uint64_t elec_timeout_high = 30000;
@@ -61,17 +60,17 @@ uint64_t latest_hb_received;
 unsigned long long g_timerfreq;
 
 #define IS_NONE \
-    ( (SID_GET_IDX(data.cached_sid) == data.config.idx) && \
-      (!SID_GET_L(data.cached_sid)) && \
-      (SID_GET_TERM(data.cached_sid) == 0) )
+    ( (SID_GET_IDX(data.ctrl_data->sid) == data.config.idx) && \
+      (!SID_GET_L(data.ctrl_data->sid)) && \
+      (SID_GET_TERM(data.ctrl_data->sid) == 0) )
 #define IS_LEADER \
-    ( !IS_NONE && (SID_GET_IDX(data.cached_sid) == data.config.idx) && \
-      (SID_GET_L(data.cached_sid)) )
+    ( !IS_NONE && (SID_GET_IDX(data.ctrl_data->sid) == data.config.idx) && \
+      (SID_GET_L(data.ctrl_data->sid)) )
 #define IS_CANDIDATE \
-    ( !IS_NONE && (SID_GET_IDX(data.cached_sid) == data.config.idx) && \
-      (!SID_GET_L(data.cached_sid)) )
+    ( !IS_NONE && (SID_GET_IDX(data.ctrl_data->sid) == data.config.idx) && \
+      (!SID_GET_L(data.ctrl_data->sid)) )
 #define IS_FOLLOWER (!IS_NONE && !IS_LEADER && !IS_CANDIDATE)
-#define IS_SID_DIRTY (data.cached_sid != data.ctrl_data->sid)
+#define IS_SID_DIRTY (data.ctrl_data->sid != data.ctrl_data->sid)
 
 /* DARE server state */
 #define TERMINATE       0x1
@@ -88,6 +87,8 @@ FILE *log_fp;
 
 /* server data */
 dare_server_data_t data;
+
+int prev_log_entry_head = 0;
 
 dare_log_entry_det_t last_applied_entry;
 
@@ -317,7 +318,6 @@ init_server_data()
     }
     memset(data.ctrl_data, 0, sizeof(ctrl_data_t));
     data.ctrl_data->sid = SID_NULL;
-    data.cached_sid = SID_NULL;
  
     /* Set up log */
     data.log = log_new();
@@ -431,7 +431,6 @@ init_network_cb( EV_P_ ev_timer *w, int revents )
         SID_SET_TERM(data.ctrl_data->sid, 1);
         SID_SET_L(data.ctrl_data->sid);
         SID_SET_IDX(data.ctrl_data->sid, 0);
-        data.cached_sid = data.ctrl_data->sid;
         w->repeat = 0.;
         ev_timer_again(EV_A_ w);
     }
@@ -564,7 +563,7 @@ get_replicated_vote_cb( EV_P_ ev_timer *w, int revents )
     
 next:
     /* Got replicated vote */
-    info_wtime(log_fp, "Previous vote successfully retrieved\n");
+    info_wtime(log_fp, "Latest vote successfully retrieved\n");
     //memset(data.ctrl_data->sm_rep, 0, MAX_SERVER_COUNT * sizeof(sm_rep_t));
     /* Go to next recovery step */
     ev_set_cb(w, send_sm_request_cb);
@@ -621,7 +620,7 @@ poll_sm_requests()
         if (!data.ctrl_data->sm_req[i])
             continue;
 
-        info_wtime(log_fp, "SM request from $erver #%"PRIu8"\n", i);
+        info_wtime(log_fp, "SM request from p%"PRIu8"\n", i);
         
         /* Found SM request */
         data.ctrl_data->sm_req[i] = 0;
@@ -684,15 +683,14 @@ poll_sm_reply()
         }
     }
     if (target == size) return;
-    info_wtime(log_fp, "SM reply from server #%"PRIu8"\n", target);
+    info_wtime(log_fp, "SM reply from p%"PRIu8"\n", target);
     
     /* Update cache SID */
-    data.cached_sid = data.ctrl_data->sid;
     info_wtime(log_fp, "SID OBTAINED DURING SM RECOVERY: "
             "[%020"PRIu64"|%d|%03"PRIu8"]\n", 
-            SID_GET_TERM(data.cached_sid),
-            (SID_GET_L(data.cached_sid) ? 1 : 0),
-            SID_GET_IDX(data.cached_sid));
+            SID_GET_TERM(data.ctrl_data->sid),
+            (SID_GET_L(data.ctrl_data->sid) ? 1 : 0),
+            SID_GET_IDX(data.ctrl_data->sid));
     
     /* Recover SM */
     rc = dare_ib_recover_sm(target);
@@ -754,23 +752,7 @@ recover_log_cb( EV_P_ ev_timer *w, int revents )
     }
     else {
         /* I have a proper SID */
-        server_sid_modified();
-        if (SID_GET_L(data.ctrl_data->sid)) {
-            /* Send vote ACK to notify the leader that my log is accessible */
-            info_wtime(log_fp, "Send vote ACK to notify the leader that my log is accessible\n");
-            rc = dare_ib_send_vote_ack();
-            if (rc < 0) {
-                /* Operation failed; start an election */
-                hb_event.repeat = 0.;
-                ev_timer_again(data.loop, &hb_event);
-                start_election(); 
-                return;
-            }
-            if (0 != rc) {
-                /* This should never happen */
-                error_exit(1, log_fp, "Cannot send vote ack\n");
-            }
-        }
+        server_to_follower();
     }
     return;
 
@@ -796,7 +778,7 @@ to_adjust_cb( EV_P_ ev_timer *w, int revents )
     static uint64_t fp_count = 0;
 
     uint64_t hb;
-    uint8_t leader = SID_GET_IDX(data.cached_sid);
+    uint8_t leader = SID_GET_IDX(data.ctrl_data->sid);
     
     if (hb_timeout_flag) {
         w->repeat = 0;
@@ -862,7 +844,6 @@ hb_receive_cb( EV_P_ ev_timer *w, int revents )
     
     if (data.config.idx >= size) {
         /* I'm not YET part of the group */
-        //w->repeat = random_election_timeout();
         w->repeat = hb_timeout();
         ev_timer_again(EV_A_ w);
         return;
@@ -870,12 +851,9 @@ hb_receive_cb( EV_P_ ev_timer *w, int revents )
     
     /* Be sure that the tail does not remain set from a previous leadership */
     data.log->tail = data.log->len;
-    
-    /* Update the cached SID */
-    data.cached_sid = data.ctrl_data->sid;
 
-    uint8_t leader = SID_GET_IDX(data.cached_sid);
-    new_sid = data.cached_sid;
+    uint8_t leader = SID_GET_IDX(data.ctrl_data->sid);
+    new_sid = data.ctrl_data->sid;
     for (i = 0; i < size; i++) {
         if ( (i == data.config.idx) || !CID_IS_SERVER_ON(data.config.cid, i) )
             continue;
@@ -898,9 +876,9 @@ hb_receive_cb( EV_P_ ev_timer *w, int revents )
         if (hb < new_sid) {
             if (SID_GET_L(hb)) {
                 /* Received HB from outdated leader */
-                info_wtime(log_fp, "Received outdated HB from #%"PRIu8"\n", i);
+                info_wtime(log_fp, "Received outdated HB from p%"PRIu8"\n", i);
                 info(log_fp, "   # HB: [%010"PRIu64"|%d|%03"PRIu8"]; "
-                    "NEW_SID: [%010"PRIu64"|%d|%03"PRIu8"]\n",
+                    "local SID: [%010"PRIu64"|%d|%03"PRIu8"]\n",
                     SID_GET_TERM(hb), (SID_GET_L(hb) ? 1 : 0),
                     SID_GET_IDX(hb), SID_GET_TERM(new_sid),
                     (SID_GET_L(new_sid) ? 1 : 0), SID_GET_IDX(new_sid) );
@@ -928,38 +906,21 @@ hb_receive_cb( EV_P_ ev_timer *w, int revents )
         return;
     }
  
-    if (new_sid != data.cached_sid) {
+    if (new_sid != data.ctrl_data->sid) {       
         /* This SID is better */
-        rc = server_update_sid(new_sid, data.cached_sid);
+        uint64_t old_sid = data.ctrl_data->sid;
+        rc = server_update_sid(new_sid, data.ctrl_data->sid);
         if (0 != rc) {
-            /* Cannot update SID: probably SID cache is dirty; 
-            live to fight another day :) */
+            /* Cannot update SID */
             return;
         }
-        /* If the HB has the same term, then it is from the recently elected leader
-        Note: no need for updating log access; already did it when voting */
-        if (SID_GET_TERM(new_sid) != SID_GET_TERM(data.cached_sid)) {
-            /* New leader */
-            info_wtime(log_fp, "NEW LEADER: %"PRIu8"\n", SID_GET_IDX(new_sid));
-            data.cached_sid = data.ctrl_data->sid;
-            server_sid_modified();
-            /* Send ACK to the leader; this will notify it that my log is accessible;
-            thus, we avoid the delays due to LOG QPs restarts */
-            rc = dare_ib_send_vote_ack();
-            if (rc < 0) {
-                /* Operation failed; start an election */
-                w->repeat = 0.;
-                ev_timer_again(EV_A_ w);
-                start_election(); 
-                return;
-            }
-            if (0 != rc) {
-                /* This should never happen */
-                error_exit(1, log_fp, "Cannot send vote ack\n");
-            }
-        } 
-        else data.cached_sid = data.ctrl_data->sid;
         
+        /* If the HB has the same term, then it is from the recently elected leader */
+        if (SID_GET_TERM(old_sid) != SID_GET_TERM(data.ctrl_data->sid)) {
+            /* New leader */
+            info_wtime(log_fp, "[T%"PRIu64"] Follow p%"PRIu8"\n", SID_GET_TERM(data.ctrl_data->sid), SID_GET_IDX(data.ctrl_data->sid));
+            server_to_follower();
+        }
         return;
     }
     
@@ -982,7 +943,7 @@ hb_send_cb( EV_P_ ev_timer *w, int revents )
     
     /* Check if any server sent an HB reply; if that's the case, we need 
      * to incorporate that server into the active servers; restart election */
-    uint64_t new_sid = data.cached_sid;
+    uint64_t new_sid = data.ctrl_data->sid;
     uint64_t hb;
     uint8_t i, size;
     
@@ -998,24 +959,15 @@ hb_send_cb( EV_P_ ev_timer *w, int revents )
         if (hb < new_sid) continue;
 
         /* Somebody sent me an HB reply with a higher term */
-        info_wtime(log_fp, "Received HB from #%"PRIu8" with higher term %"PRIu64"\n", 
+        info_wtime(log_fp, "Received HB from p%"PRIu8" with higher term %"PRIu64"\n", 
                     i, SID_GET_TERM(hb));
-        rc = server_update_sid(new_sid, data.cached_sid);
+        rc = server_update_sid(new_sid, data.ctrl_data->sid);
         if (0 != rc) {
-            /* Cannot update SID: probably SID cache is dirty; 
-            live to fight another day :) */
+            /* Cannot update SID */
             return;
         }
-        data.cached_sid = data.ctrl_data->sid;
-        server_sid_modified();
+        server_to_follower();
         return;
-        //SID_SET_TERM(data.cached_sid, SID_GET_TERM(hb));
-        
-        /* Start election */
-        //w->repeat = 0.;
-        //ev_timer_again(EV_A_ w);
-        //start_election();
-        //return;
     }
 
     /* Send HB to all servers */
@@ -1093,7 +1045,7 @@ polling()
 #if 0
     while(1) {
         if (data.config.idx == 0) {
-            SID_SET_TERM(data.cached_sid, 20);
+            SID_SET_TERM(data.ctrl_data->sid, 20);
             dare_ib_revoke_log_access();
             dare_ib_restore_log_access();
             int i;
@@ -1110,11 +1062,11 @@ polling()
             info_wtime(log_fp, "DONE\n");
         }
         else if (data.config.idx == 1) {
-            SID_SET_TERM(data.cached_sid, 20);
+            SID_SET_TERM(data.ctrl_data->sid, 20);
             dare_ib_revoke_log_access();
             dare_ib_restore_log_access();
             sleep(2);
-            SID_SET_TERM(data.cached_sid, 40);
+            SID_SET_TERM(data.ctrl_data->sid, 40);
             dare_ib_revoke_log_access();
             dare_ib_restore_log_access();
             while(1) {
@@ -1125,7 +1077,7 @@ polling()
             }
         }
         else if (data.config.idx == 2) {
-            SID_SET_TERM(data.cached_sid, 40);
+            SID_SET_TERM(data.ctrl_data->sid, 40);
             dare_ib_revoke_log_access();
             dare_ib_restore_log_access();
             sleep(3);
@@ -1263,11 +1215,11 @@ check_failure_count()
             /* In stable configuration, the leader can remove 
             unresponsive servers (on the CTRL QP) */ 
             if ( (IS_LEADER) && (CID_STABLE == data.config.cid.state) ) {
-            //log_append_entry(data.log, SID_GET_TERM(data.cached_sid), 0, 0, 
+            //log_append_entry(data.log, SID_GET_TERM(data.ctrl_data->sid), 0, 0, 
               //  NOOP, NULL);
                 dare_ib_disconnect_server(i);
                 CID_SERVER_RM(cid, i);
-                info_wtime(log_fp, "REMOVE SERVER #%"PRIu8"\n", i);
+                info_wtime(log_fp, "REMOVE SERVER p%"PRIu8"\n", i);
                 //info(log_fp, "   # Time till removal: %lf\n", ev_now(data.loop) - start_ts); 
             }
         }
@@ -1286,7 +1238,7 @@ check_failure_count()
         data.config.cid = cid;
         data.config.req_id = 0;
         data.config.clt_id = 0;
-        log_append_entry(data.log, SID_GET_TERM(data.cached_sid), 0, 0, 
+        log_append_entry(data.log, SID_GET_TERM(data.ctrl_data->sid), 0, 0, 
                 CONFIG, &data.config.cid);
     }
 }
@@ -1303,10 +1255,13 @@ static double
 random_election_timeout()
 {
     /* Generate time in microseconds in given interval */
-    ev_tstamp time = ev_now(data.loop);
-    srand48(getpid() * time);
+    struct timeval tv;
+    gettimeofday(&tv,NULL);
+    uint64_t seed = data.config.idx*((tv.tv_sec%100)*1e6+tv.tv_usec);
+    srand48(seed);
     uint64_t timeout = (lrand48() % (elec_timeout_high-elec_timeout_low)) 
                         + elec_timeout_low;
+//info(log_fp, "election to in sec: %lf\n", (double)timeout * 1e-6);
     /* Return time in seconds */
     return (double)timeout * 1e-6;
 }
@@ -1332,33 +1287,29 @@ start_election()
     uint64_t new_sid = 0;    
     
     /* Set SID to [t+1|0|own_idx] */
-    SID_SET_TERM(new_sid, SID_GET_TERM(data.cached_sid) + 10);
+    SID_SET_TERM(new_sid, SID_GET_TERM(data.ctrl_data->sid) + 1);
     SID_UNSET_L(new_sid);                   // no leader :(
     SID_SET_IDX(new_sid, data.config.idx);  // I can be the leader :)
-    
-    /* Update SID */
-    rc = server_update_sid(new_sid, data.cached_sid);
+    rc = server_update_sid(new_sid, data.ctrl_data->sid);
     if (0 != rc) {
         return;
     }
-    data.cached_sid = data.ctrl_data->sid;
-    if (data.cached_sid != new_sid) {
-        debug(log_fp, "SID got updated\n");
-        server_sid_modified();
-        return;
-    }
-    info_wtime(log_fp, "STARTING ELECTION (term=%"PRIu64")\n", SID_GET_TERM(data.cached_sid));
-    PRINT_CID(data.config.cid);PRINT_SID_(data.cached_sid);
+    
+    info(log_fp, "\n");
+    info_wtime(log_fp, "[T%"PRIu64"] Start election\n", 
+            SID_GET_TERM(data.ctrl_data->sid));
+    PRINT_CID(data.config.cid); PRINT_SID_(data.ctrl_data->sid);
     INFO_PRINT_LOG(log_fp, data.log);
     
+    TEXT_PRINT_LOG(log_fp, data.log);
+ 
     /* Revoke access to the local log; we need exclusive access */
     rc = dare_ib_revoke_log_access();
     if (0 != rc) {
         /* This should never happen */
         error_exit(1, log_fp, "Cannot get exclusive access to local log\n");
     }
-    TEXT_PRINT_LOG(log_fp, data.log);
-    
+   
     /**
      *  Become a candidate 
      */
@@ -1398,15 +1349,15 @@ poll_vote_count()
     vote_count[0] = 1;
     vote_count[1] = 1;
     uint8_t i, size = get_group_size(data.config);
-    uint64_t remote_write;
+    uint64_t remote_commit;
     
     //TIMER_INIT;
     
     //TIMER_START(log_fp, "Start counting votes...");
     for (i = 0; i < size; i++) {
         if (i == data.config.idx) continue;
-        remote_write = data.ctrl_data->vote_ack[i];
-        if (data.log->len == remote_write) {
+        remote_commit = data.ctrl_data->vote_ack[i];
+        if (data.log->len == remote_commit) {
             /* No reply from this server */
             continue;
         }
@@ -1418,13 +1369,13 @@ poll_vote_count()
             vote_count[1]++;
         }
         
-        /* Store the received write offset */
-        data.ctrl_data->log_offsets[i].write = remote_write;
-        /* No need to get the write offset for this server */
+        /* Store the received commit offset */
+        data.ctrl_data->log_offsets[i].commit = remote_commit;
+        /* No need to get the commit offset for this server */
         data.config.servers[i].next_lr_step = LR_GET_NCE_LEN;
-        if (log_is_offset_larger(data.log, remote_write, data.log->write)) {
-            /* Update local write offset */
-            data.log->write = remote_write;
+        if (log_is_offset_larger(data.log, remote_commit, data.log->commit)) {
+            /* Update local commit offset */
+            data.log->commit = remote_commit;
         }
     }
     //TIMER_STOP(log_fp);
@@ -1440,9 +1391,9 @@ poll_vote_count()
     info(log_fp, "Votes:");
     for (i = 0; i < size; i++) {
         if (i == data.config.idx) continue;
-        remote_write = data.ctrl_data->vote_ack[i];
-        if (data.log->len != remote_write) {
-            info(log_fp, " (#%"PRIu8")", i);
+        remote_commit = data.ctrl_data->vote_ack[i];
+        if (data.log->len != remote_commit) {
+            info(log_fp, " (p%"PRIu8")", i);
         }
     }
     info(log_fp, "\n");
@@ -1453,19 +1404,13 @@ poll_vote_count()
     //debug(log_fp, "vote count = %"PRIu8"\n", vote_count[0]);
     
     /* Update own SID to [t|1|own_idx] */
-    uint64_t new_sid = data.cached_sid;
+    uint64_t new_sid = data.ctrl_data->sid;
     SID_SET_L(new_sid);
-    rc = server_update_sid(new_sid, data.cached_sid);
+    rc = server_update_sid(new_sid, data.ctrl_data->sid);
     if (0 != rc) {
         return;
     }    
-    data.cached_sid = data.ctrl_data->sid;
-    if (data.cached_sid != new_sid) {
-        debug(log_fp, "Seriously! And I was so close...\n");
-        server_sid_modified();
-        return;
-    }
-    info_wtime(log_fp, "LEADER (term:%"PRIu64") ", SID_GET_TERM(new_sid));
+    info_wtime(log_fp, "[T%"PRIu64"] LEADER\n", SID_GET_TERM(new_sid));
     INFO_PRINT_LOG(log_fp, data.log);
     info(log_fp, "CID: [%02"PRIu8"|%02"PRIu8"|%d|%03"PRIu32"]\n", 
             data.config.cid.size[0], data.config.cid.size[1], 
@@ -1475,7 +1420,7 @@ poll_vote_count()
     /* Go through the CONFIG entries => update configuration */
     poll_config_entries();
     
-    /* Apply all committed entries => equal read and write offsets 
+    /* Apply all committed entries => equal apply and commit offsets 
     Note: when applying an unstable CONFIG entry from the same epoch, 
     the new leader automatically adds the subsequent transition */
     apply_committed_entries();
@@ -1489,7 +1434,7 @@ poll_vote_count()
         data.config.req_id = 0;
         data.config.clt_id = 0;
         data.last_write_csm_idx = log_append_entry(data.log, 
-            SID_GET_TERM(data.cached_sid), 0, 0, CONFIG, &data.config.cid);
+            SID_GET_TERM(data.ctrl_data->sid), 0, 0, CONFIG, &data.config.cid);
         goto become_leader;
     }
     
@@ -1515,7 +1460,7 @@ poll_vote_count()
         => the last unstable CONFIG is also not applied; when the leader 
         applies it, the configuration state changes */
         data.last_write_csm_idx = log_append_entry(data.log, 
-            SID_GET_TERM(data.cached_sid), 0, 0, NOOP, NULL);
+            SID_GET_TERM(data.ctrl_data->sid), 0, 0, NOOP, NULL);
         goto become_leader;
     }
     
@@ -1559,7 +1504,7 @@ poll_vote_count()
     /* Append CONFIG entry as BLANK entry */
     PRINT_CONF_TRANSIT(old_cid, data.config.cid);
     data.last_write_csm_idx = log_append_entry(data.log, 
-        SID_GET_TERM(data.cached_sid), data.config.req_id, 
+        SID_GET_TERM(data.ctrl_data->sid), data.config.req_id, 
         data.config.clt_id, CONFIG, &data.config.cid);
 
 become_leader:
@@ -1576,12 +1521,12 @@ become_leader:
     /* Start log pruning */
     size = get_extended_group_size(data.config);
     for (i = 0; i < size; i++) {
-        data.ctrl_data->read_offsets[i] = data.log->head;
+        data.ctrl_data->apply_offsets[i] = data.log->head;
     }
     prune_event.repeat = NOW;
     ev_timer_again(data.loop, &prune_event);
     
-    /* Restore log access */
+    /* Gain log access */
     rc = dare_ib_restore_log_access();
     if (0 != rc) {
         /* This should never happen */
@@ -1604,7 +1549,7 @@ poll_vote_requests()
     vote_req_t *request;
     
     /* To avoid crazy servers removing good leaders */
-    if (SID_GET_L(data.cached_sid)) {
+    if (SID_GET_L(data.ctrl_data->sid)) {
         /* Active leader known; just ignore vote requests 
         Note: a leader renounces its leadership when it receives 
         an HB reply from a server with a larger term */
@@ -1613,21 +1558,21 @@ poll_vote_requests()
     
     /* No leader known; make sure about this, do not wait for the 
     timeout to check the HB array.
-    This applies for nodes that voted but are not aware of the outcome */
-    uint8_t possible_leader = SID_GET_IDX(data.cached_sid);
+    !! This applies for nodes that voted but are not aware of the outcome */
+    uint8_t possible_leader = SID_GET_IDX(data.ctrl_data->sid);
     uint64_t hb = data.ctrl_data->hb[possible_leader];
-    if ( (0 != hb) && (SID_GET_TERM(hb) == SID_GET_TERM(data.cached_sid)) ) {
+    if ( (0 != hb) && (SID_GET_TERM(hb) == SID_GET_TERM(data.ctrl_data->sid)) ) {
         /* My vote counts (democracy at its best)...  */
-        server_update_sid(hb, data.cached_sid);
-        data.cached_sid = data.ctrl_data->sid;
+        server_update_sid(hb, data.ctrl_data->sid);
         return;
     }
 
-    /* Okay, so there is no known leader... 
-    ...look for vote requests. Find out the request with the best SID.
-    Note: we set the L flag to be sure the server 
-    does not vote twice in the same term */
-    uint64_t old_sid = data.cached_sid; SID_SET_L(old_sid);
+    /* Okay, so there is no known leader;
+    look for vote requests and find out the request with the best SID.
+    
+    Note: set the L flag to avoid voting twice in the same term:
+          SID=[TERM|L|IDX] => [TERM|1|voted_idx] > [TERM|0|*] */
+    uint64_t old_sid = data.ctrl_data->sid; SID_SET_L(old_sid);
     uint64_t best_sid = old_sid;
     for (i = 0; i < size; i++) {
         if (i == data.config.idx) continue;
@@ -1636,193 +1581,182 @@ poll_vote_requests()
             text(log_fp, "Vote request from:"); PRINT_SID_(request->sid); 
         }
         if (best_sid >= request->sid) {
-            /* Candidate's SID is not good enough */
+            /* Candidate's SID is not good enough; drop request */
             request->sid = 0;
             continue;
         }
-        /* Don't reset it yet */
+        /* Don't reset "request->sid" yet */
         best_sid = request->sid;
+        /* Note: we iterate through the vote requests in idx order; thus, 
+        other requests for the same term are also considered */
     }
-    /* Check if any of the requests come from a server with a larger term */ 
-    if (best_sid != old_sid) {
-        /* I thought I saw a better candidate ... */
-        uint64_t highest_term = SID_GET_TERM(best_sid);
-        TIMER_INIT;
-        TIMER_START(log_fp, "Vote request from a good candidate...");
-        
-        info_wtime(log_fp, "Vote request from (#%"PRIu8", T%"PRIu64")\n", 
-            SID_GET_IDX(best_sid), SID_GET_TERM(best_sid));        
-               
-        /* Revoke remote access to local log; need to have exclusive 
-         * access to the log to get the last entry */
-        rc = dare_ib_revoke_log_access();
-        if (0 != rc) {
-            /* This should never happen */
-            error_exit(1, log_fp, "Cannot lock local log\n");
-        }
-        
-        /* Create not committed buffer & get best request */
-        vote_req_t best_request;
-        best_request.sid = old_sid;
-        dare_nc_buf_t *nc_buf = &data.log->nc_buf[data.config.idx];
-        log_entries_to_nc_buf(data.log, nc_buf);
-        if (0 == nc_buf->len) {
-            /* There are no not committed entries */
-            uint64_t tail = log_get_tail(data.log);
-            if (tail == data.log->len) {
-                best_request.index = 0;
-                best_request.term  = 0;
-            }
-            else {
-                dare_log_entry_t* last_entry = 
-                        log_get_entry(data.log, &tail);
-                best_request.index = last_entry->idx;
-                best_request.term  = last_entry->term;
-            }
+    if (best_sid == old_sid) {
+        /* No better SID */
+        return;
+    }
+    
+    /* I thought I saw a better candidate ... */
+    uint64_t highest_term = SID_GET_TERM(best_sid);
+    TIMER_INIT;
+    TIMER_START(log_fp, "Vote request from a good candidate...");
+    
+    //~ info_wtime(log_fp, "Vote request from (p%"PRIu8", T%"PRIu64")\n", 
+        //~ SID_GET_IDX(best_sid), SID_GET_TERM(best_sid));        
+           
+    /* Revoke remote access to local log; need to have exclusive 
+     * access to the log to get the last entry */
+    rc = dare_ib_revoke_log_access();
+    if (0 != rc) {
+        /* This should never happen */
+        error_exit(1, log_fp, "Cannot lock local log\n");
+    }
+    
+    /* Create not committed buffer & get best request */
+    vote_req_t best_request;
+    best_request.sid = old_sid;
+    dare_nc_buf_t *nc_buf = &data.log->nc_buf[data.config.idx];
+    log_entries_to_nc_buf(data.log, nc_buf);
+    if (0 == nc_buf->len) {
+        /* There are no not committed entries */
+        uint64_t tail = log_get_tail(data.log);
+        if (tail == data.log->len) {
+            best_request.index = 0;
+            best_request.term  = 0;
         }
         else {
-            /* Get last entry from not committed buffer */
-            best_request.index = nc_buf->entries[nc_buf->len-1].idx;
-            best_request.term  = nc_buf->entries[nc_buf->len-1].term;
+            dare_log_entry_t* last_entry = 
+                    log_get_entry(data.log, &tail);
+            best_request.index = last_entry->idx;
+            best_request.term  = last_entry->term;
         }
-        
+    }
+    else {
+        /* Get last entry from not committed buffer */
+        best_request.index = nc_buf->entries[nc_buf->len-1].idx;
+        best_request.term  = nc_buf->entries[nc_buf->len-1].term;
+    }
+    
 //text(log_fp, "\n   Local [idx=%"PRIu64"; term=%"PRIu64"]\n", best_request.index, best_request.term);        
-        info(log_fp, "   # Local [idx=%"PRIu64"; term=%"PRIu64"]\n", 
-                best_request.index, best_request.term);        
-        /* Choose the best candidate */
-        for (i = 0; i < size; i++) {
-            request = &(data.ctrl_data->vote_req[i]);
-            if (best_request.sid > request->sid) {
-                /* Candidate's SID is not good enough */
-                request->sid = 0;
-                continue;
-            }
-            if (highest_term < SID_GET_TERM(request->sid))
-                highest_term = SID_GET_TERM(request->sid);
-//text(log_fp, "   Remote(%"PRIu8") [idx=%"PRIu64"; term=%"PRIu64"]\n", i, request->index,request->term);
-            info(log_fp, "   # Remote(#%"PRIu8") [idx=%"PRIu64"; term=%"PRIu64"]\n", 
-                        i, request->index, request->term);
-            if ( (best_request.term > request->term) || 
-                 ((best_request.term == request->term) && 
-                  (best_request.index > request->index)) )
-            {
-                /* Candidate's log is not good enough */
-                request->sid = 0;
-                continue;
-            }
-            /* I like this candidate */
-            best_request.index = request->index;
-            best_request.term = request->term;
-            best_request.sid = request->sid;
-            best_request.cid = request->cid;
+    info(log_fp, "   # Local [idx=%"PRIu64"; term=%"PRIu64"]\n", 
+            best_request.index, best_request.term);        
+    /* Choose the best candidate */
+    for (i = 0; i < size; i++) {
+        request = &(data.ctrl_data->vote_req[i]);
+        if (best_request.sid > request->sid) {
+            /* Candidate's SID is not good enough; drop request */
             request->sid = 0;
+            continue;
         }
+        if (highest_term < SID_GET_TERM(request->sid))
+            highest_term = SID_GET_TERM(request->sid);
+//text(log_fp, "   Remote(%"PRIu8") [idx=%"PRIu64"; term=%"PRIu64"]\n", i, request->index,request->term);
+        info(log_fp, "   # Remote(p%"PRIu8") [idx=%"PRIu64"; term=%"PRIu64"]\n", 
+                    i, request->index, request->term);
+        if ( (best_request.term > request->term) || 
+             ((best_request.term == request->term) && 
+              (best_request.index > request->index)) )
+        {
+            /* Candidate's log is not good enough; drop request */
+            request->sid = 0;
+            continue;
+        }
+        /* I like this candidate */
+        best_request.index = request->index;
+        best_request.term = request->term;
+        best_request.sid = request->sid;
+        best_request.cid = request->cid;
+        request->sid = 0;
+    }
 text(log_fp, "   Best [idx=%"PRIu64"; term=%"PRIu64"]\n", best_request.index, best_request.term);
 
-        if (best_request.sid == old_sid) {
-            /* Local log is better than remove logs; 
-            however, local term is too low
-            => set term to the highest possible */
-            new_sid = data.cached_sid;
-            SID_SET_TERM(new_sid, highest_term);
-            rc = server_update_sid(new_sid, data.cached_sid);
-            if (0 != rc) {
-                /* Could not update my SID; just return */
-                return;
-            }
-            /* Update cached SID */
-            data.cached_sid = data.ctrl_data->sid;
-
-            /* Restore access to the log */
-            rc = dare_ib_restore_log_access();
-            if (0 != rc) {
-                /* This should never happen */
-                error_exit(1, log_fp, "Cannot restore log access\n");
-            }
-            TIMER_STOP(log_fp); 
-            return;
-        }
-        /* ... I did, I did saw a better candidate :) */
-info_wtime(log_fp, "BETTER CANDIDATE [%020"PRIu64"|%d|%03"PRIu8"]\n", 
-        SID_GET_TERM(best_request.sid), (SID_GET_L(best_request.sid) ? 1 : 0), 
-        SID_GET_IDX(best_request.sid));
-//info(log_fp, "MY SIDS: "); PRINT_SID(data.ctrl_data->sid);PRINT_SID_(data.cached_sid);
-//info(log_fp, "My log: "); INFO_PRINT_LOG(log_fp, data.log);
-         
-        /* Stop HB mechanism for the moment ... */
-        hb_event.repeat = 0.;
-        ev_timer_again(data.loop, &hb_event); 
-        
-        /* Update my local SID to show support */
-        rc = server_update_sid(best_request.sid, data.cached_sid);
+    if (best_request.sid == old_sid) {
+        /* Local log is better than remote logs; yet, local term is too low. 
+        Increase TERM to increase chances to win election */
+        new_sid = data.ctrl_data->sid;
+        SID_SET_TERM(new_sid, highest_term);
+        SID_SET_IDX(new_sid, data.config.idx);  // don't vote for anyone
+        rc = server_update_sid(new_sid, data.ctrl_data->sid);
         if (0 != rc) {
             /* Could not update my SID; just return */
             return;
         }
-        /* Update cached SID */
-        data.cached_sid = data.ctrl_data->sid;
-        if (data.cached_sid != best_request.sid) {
-            server_sid_modified();
-            return;
-        }        
+        TIMER_STOP(log_fp); 
+        return;
+    }
+    
+    /* ... I did, I did saw a better candidate :) */
+    info_wtime(log_fp, "[T%"PRIu64"] Vote for p%"PRIu8"\n", 
+                SID_GET_TERM(best_request.sid), 
+                SID_GET_IDX(best_request.sid));
+//info(log_fp, "MY SIDS: "); PRINT_SID(data.ctrl_data->sid);PRINT_SID_(data.ctrl_data->sid);
+//info(log_fp, "My log: "); INFO_PRINT_LOG(log_fp, data.log);
+     
+    /* Stop HB mechanism for the moment ... */
+    hb_event.repeat = 0.;
+    ev_timer_again(data.loop, &hb_event); 
+    
+    /* Update my local SID to show support */
+    rc = server_update_sid(best_request.sid, data.ctrl_data->sid);
+    if (0 != rc) {
+        /* Could not update my SID; just return */
+        return;
+    }       
 
-        /* Update configuration according to the candidate */
-        update_cid(best_request.cid);
-                
-        /* Replicate this SID in case I crash */
-        rc = dare_ib_replicate_vote();
-        if (0 != rc) {
-            /* This should never happen */
-            error_exit(1, log_fp, "Cannot replicate votes\n");
-        }
+    /* Update configuration according to the candidate */
+    update_cid(best_request.cid);
+            
+    /* Replicate this SID in case I crash */
+    rc = dare_ib_replicate_vote();
+    if (0 != rc) {
+        /* This should never happen */
+        error_exit(1, log_fp, "Cannot replicate votes\n");
+    }
 //debug(log_fp, "Vote replicated\n");
-        
-        /* Restore access to the log */
-        rc = dare_ib_restore_log_access();
-        if (0 != rc) {
-            /* This should never happen */
-            error_exit(1, log_fp, "Cannot restore log access\n");
-        }
-//debug(log_fp, "Log access restored\n");
+    
+    // same as server_to_follower(), but no log_entries_to_nc_buf() 
+    
+    /* Stop log pruning */
+    prune_event.repeat = 0.;
+    ev_timer_again(data.loop, &prune_event);
 
-        /* Stop log pruning */
-        prune_event.repeat = 0.;
-        ev_timer_again(data.loop, &prune_event);
-
-        leader_failed = 0;
-        if (!hb_timeout_flag) {
-            /* Restart timeout adjusting mechanism */
-            to_adjust_event.repeat = recomputed_hb_timeout;
-            ev_timer_again(data.loop, &to_adjust_event);
-        }
-        
-        /* Send ACK to the candidate */
-        rc = dare_ib_send_vote_ack();
-        if (rc < 0) {
-            /* Operation failed; start an election */
-            hb_event.repeat = 0.;
-            ev_timer_again(data.loop, &hb_event);
-            start_election(); 
-            return;
-        }
-        if (0 != rc) {
-            /* This should never happen */
-            error_exit(1, log_fp, "Cannot send vote ack\n");
-        }
+    leader_failed = 0;
+    if (!hb_timeout_flag) {
+        /* Restart timeout adjusting mechanism */
+        to_adjust_event.repeat = recomputed_hb_timeout;
+        ev_timer_again(data.loop, &to_adjust_event);
+    }
+    
+    /* Restore access to the log (for the supported candidate) */
+    rc = dare_ib_restore_log_access();
+    if (0 != rc) {
+        /* This should never happen */
+        error_exit(1, log_fp, "Cannot restore log access\n");
+    }
+    
+    /* Send ACK to the candidate */
+    rc = dare_ib_send_vote_ack();
+    if (rc < 0) {
+        /* Operation failed; start an election */
+        start_election(); 
+        return;
+    }
+    if (0 != rc) {
+        /* This should never happen */
+        error_exit(1, log_fp, "Cannot send vote ack\n");
+    }
 //debug(log_fp, "Send vote ACK\n");
 
-        /* Restart HB mechanism in receive mode */
-        ev_set_cb(&hb_event, hb_receive_cb);
-        // TODO: this should be a different timeout
-        //double tmp = random_election_timeout(); 
-        double tmp = hb_timeout();
-        //hb_event.repeat = random_election_timeout();
-        hb_event.repeat = tmp;
-        ev_timer_again(data.loop, &hb_event); 
-        info_wtime(log_fp, "Just voted; lets wait for %lf sec\n", tmp);
-        
-        TIMER_STOP(log_fp); 
-    }
+    /* Restart HB mechanism in receive mode */
+    ev_set_cb(&hb_event, hb_receive_cb);
+    // TODO: this should be a different timeout
+    //double tmp = random_election_timeout(); 
+    double tmp = hb_timeout();
+    //hb_event.repeat = random_election_timeout();
+    hb_event.repeat = tmp;
+    ev_timer_again(data.loop, &hb_event); 
+    //info_wtime(log_fp, "Just voted; lets wait for %lf sec\n", tmp);
+    
+    TIMER_STOP(log_fp); 
 }
 
 #endif
@@ -1836,7 +1770,7 @@ commit_new_entries()
 {
     int rc;
  
-    if (log_offset_end_distance(data.log, data.log->write)) {
+    if (log_offset_end_distance(data.log, data.log->commit)) {
         //info_wtime(log_fp, "TRY TO COMMIT NEW ENTRY\n");
         //INFO_PRINT_LOG(log_fp, data.log);
         rc = dare_ib_write_remote_logs(1);
@@ -1860,7 +1794,7 @@ commit_new_entries()
             if ( (data.config.servers[i].next_lr_step != LR_UPDATE_LOG) ||
                 (data.ctrl_data->log_offsets[i].end != data.log->end) )
             {
-            //info(log_fp, "step=%"PRIu8", e=%"PRIu64"\n", data.config.servers[i].next_lr_step, data.ctrl_data->log_offsets[i].end);
+            //info(log_fp, "p%"PRIu8": log update -- step=%"PRIu8", end=%"PRIu64"\n", i, data.config.servers[i].next_lr_step, data.ctrl_data->log_offsets[i].end);
                 /* Write remote logs to bring server up to date */
                 rc = dare_ib_write_remote_logs(0);
                 if (0 != rc) {
@@ -1881,10 +1815,10 @@ apply_committed_entries()
     int rc;
     int once = 0;
     
-    uint64_t old_read = data.log->read;
+    uint64_t old_apply = data.log->apply;
     dare_log_entry_t *entry;
     while (log_is_offset_larger(data.log, 
-                data.log->write, data.log->read))
+                data.log->commit, data.log->apply))
     {
         if (!IS_LEADER) {
             //text_wtime(log_fp, "New committed entries ");
@@ -1893,17 +1827,17 @@ apply_committed_entries()
         else {
             if (!once) {
                 //info_wtime(log_fp, "New entries committed: %"PRIu64" -> %"PRIu64"\n", 
-                //    data.log->read, data.log->write);
+                //    data.log->apply, data.log->commit);
                 once = 1;
             }
         }
 
         /* Get entry (cannot be NULL);
-        Note: the read offset is updated locally  */
-        entry = log_get_entry(data.log, &data.log->read);
-        if (!log_fit_entry(data.log, data.log->read, entry)) {
+        Note: the apply offset is updated locally  */
+        entry = log_get_entry(data.log, &data.log->apply);
+        if (!log_fit_entry(data.log, data.log->apply, entry)) {
             /* Not enough place for an entry (with the command) */
-            data.log->read = 0;
+            data.log->apply = 0;
             continue;
         }
         
@@ -2000,7 +1934,7 @@ apply_committed_entries()
         data.config.clt_id = clt_id;
         PRINT_CONF_TRANSIT(old_cid, data.config.cid);
         /* Append CONFIG entry */
-        log_append_entry(data.log, SID_GET_TERM(data.cached_sid), 
+        log_append_entry(data.log, SID_GET_TERM(data.ctrl_data->sid), 
                         req_id, clt_id, CONFIG, &data.config.cid);
         goto apply_next_entry;
         
@@ -2015,7 +1949,7 @@ apply_entry:
                 }
             }
             //else {
-            //    if (SID_GET_TERM(data.cached_sid) < 50) sleep(1);
+            //    if (SID_GET_TERM(data.ctrl_data->sid) < 50) sleep(1);
             //}
             rc = data.sm->apply_cmd(data.sm, &entry->data.cmd, NULL);
             if (0 != rc) {
@@ -2023,19 +1957,19 @@ apply_entry:
             }
             last_applied_entry.idx = entry->idx;
             last_applied_entry.term = entry->term;
-            last_applied_entry.offset = data.log->read;
+            last_applied_entry.offset = data.log->apply;
             /* Needed for answering read requests */
             data.last_cmt_write_csm_idx = entry->idx;
         }
         
 apply_next_entry:        
-        /* Advance read offset */
-        data.log->read += log_entry_len(entry);
+        /* Advance apply offset */
+        data.log->apply += log_entry_len(entry);
     }
     
     /* When new entries are applied, the leader verifies if there are 
     pending read requests */
-    if ((old_read != data.log->read) && IS_LEADER) {
+    if ((old_apply != data.log->apply) && IS_LEADER) {
         ep_dp_reply_read_req(&data.endpoints, data.last_cmt_write_csm_idx);
     }
     
@@ -2072,7 +2006,7 @@ log_pruning()
     /* We have the requirement R1: for any server, the head offset must 
     never decrease (except for when wrapping-around the end of 
     the circular buffer).
-    Periodically, the leader reads all the remote read offsets and sets 
+    Periodically, the leader reads all the remote apply offsets and sets 
     its own head offset to the smallest one. For a given term, this 
     implies property P1: for any server, leader.h <= server.r. 
     The servers could update their head offset to the leader's head 
@@ -2084,24 +2018,24 @@ log_pruning()
     the new leader must have it in its log, hence, P2 holds.
     Properties P1 and P2 ensure the correctness of log pruning.
 
-    Also, note that the read offset of any unresponsive server equals 
+    Also, note that the apply offset of any unresponsive server equals 
     the leader's head offset; moreover, the leader has no access to 
     the log of a server that recovers. Thus, property P3: the leader's 
     head offset remains constant during a server's recovery.
     */
     
-    /* Find minimum remote read offset */
+    /* Find minimum remote apply offset */
     size = get_extended_group_size(data.config);
-    uint64_t min_offset = data.log->read;
+    uint64_t min_offset = data.log->apply;
     for (i = 0; i < size; i++) {
         if (!CID_IS_SERVER_ON(data.config.cid, i)) {
             /* Server is OFF */
-            data.ctrl_data->read_offsets[i] = data.log->read;
+            data.ctrl_data->apply_offsets[i] = data.log->apply;
         }
         if (log_is_offset_larger(data.log, min_offset, 
-                    data.ctrl_data->read_offsets[i]))
-            min_offset = data.ctrl_data->read_offsets[i];
-        //info(log_fp, "   # (#%"PRIu8"): read=%"PRIu64"\n", i, data.ctrl_data->read_offsets[i]);
+                    data.ctrl_data->apply_offsets[i]))
+            min_offset = data.ctrl_data->apply_offsets[i];
+        //info(log_fp, "   # (p%"PRIu8"): apply=%"PRIu64"\n", i, data.ctrl_data->apply_offsets[i]);
     }
     //info(log_fp, "   # min_offset = %"PRIu64"\n", min_offset);
     if (!log_offset_end_distance(data.log, min_offset)) {
@@ -2109,23 +2043,26 @@ log_pruning()
         min_offset = log_get_tail(data.log);
     }
     //info(log_fp, "   # min_offset = %"PRIu64"; head = %"PRIu64"\n", min_offset, data.log->head);
-    if (log_is_offset_larger(data.log, min_offset, data.log->head)) {
-        /* The minimum remote read offset is larger than the head offset */
+    if (log_is_offset_larger(data.log, min_offset, data.log->head) &&
+            !prev_log_entry_head)
+    {
+        /* The minimum remote apply offset is larger than the head offset */
         //info_wtime(log_fp, "Advance HEAD offset: %"PRIu64"->%"PRIu64"\n", 
-        //            data.log->head, min_offset);
+          //          data.log->head, min_offset);
         data.log->head = min_offset;
         
         dare_state &= ~SNAPSHOT;
         
         /* Append a HEAD log entry */
-        log_append_entry(data.log, SID_GET_TERM(data.cached_sid), 
+        log_append_entry(data.log, SID_GET_TERM(data.ctrl_data->sid), 
                         0, 0, HEAD, &data.log->head);
+        prev_log_entry_head = 1;
     }
     
-    /* Get remote read offsets for next prunning */
-    rc = dare_ib_get_remote_reads();
+    /* Get remote apply offsets for next prunning */
+    rc = dare_ib_get_remote_apply_offsets();
     if (0 != rc) {
-        error_return(1, log_fp, "Cannot get remote reads\n");
+        error_return(1, log_fp, "dare_ib_get_remote_apply_offsets\n");
     }
     
     return 0;
@@ -2146,15 +2083,15 @@ force_log_pruning()
                 log_size, 0.75 * data.log->len);
     size = get_extended_group_size(data.config);
     target = data.config.idx;
-    uint64_t min_offset = data.log->read;
+    uint64_t min_offset = data.log->apply;
     for (i = 0; i < size; i++) {
         if (log_is_offset_larger(data.log, min_offset, 
-                        data.ctrl_data->read_offsets[i]))
+                        data.ctrl_data->apply_offsets[i]))
         {
-            min_offset = data.ctrl_data->read_offsets[i];
+            min_offset = data.ctrl_data->apply_offsets[i];
             target = i;
         }
-        info(log_fp, "   # (#%"PRIu8"): read=%"PRIu64"\n", i, data.ctrl_data->read_offsets[i]);
+        info(log_fp, "   # (p%"PRIu8"): apply=%"PRIu64"\n", i, data.ctrl_data->apply_offsets[i]);
     }
     if (target != data.config.idx) {
         if (!CID_IS_SERVER_ON(data.config.cid, target)) {
@@ -2165,23 +2102,23 @@ force_log_pruning()
         dare_cid_t old_cid = data.config.cid;
         CID_SERVER_RM(data.config.cid, target);
         dare_ib_disconnect_server(target);
-        info_wtime(log_fp, "REMOVE SERVER #%"PRIu8"\n", target);
+        info_wtime(log_fp, "REMOVE SERVER p%"PRIu8"\n", target);
         data.config.req_id = 0;
         data.config.clt_id = 0;
         PRINT_CONF_TRANSIT(old_cid, data.config.cid);
         
         /* Append CONFIG entry */
-        log_append_entry(data.log, SID_GET_TERM(data.cached_sid), 
+        log_append_entry(data.log, SID_GET_TERM(data.ctrl_data->sid), 
                         0, 0, CONFIG, &data.config.cid);
         
-        /* Update read offset for this target */
-        data.ctrl_data->read_offsets[i] = data.log->read;
+        /* Update apply offset for this target */
+        data.ctrl_data->apply_offsets[i] = data.log->apply;
 
         /* Prune the log */
         log_pruning();
     }
     else {
-        /* All read offsets equal the leader's read offset */
+        /* All apply offsets equal the leader's apply offset */
         log_pruning();
     }
 }
@@ -2200,7 +2137,7 @@ poll_config_entries()
 {
     uint64_t head_offset = data.log->head;
     uint64_t offset = data.config.cid_offset;
-    uint64_t write = data.log->write;
+    uint64_t commit = data.log->commit;
     dare_log_entry_t *entry;
     while (log_offset_end_distance(data.log, offset)) {
         entry = log_get_entry(data.log, &offset);
@@ -2229,7 +2166,7 @@ poll_config_entries()
         else if (HEAD == entry->type) {
             /* Check only committed entries; 
             thus, the leader's head offset is always >= */
-            if (!log_is_offset_larger(data.log, offset, write)) {
+            if (!log_is_offset_larger(data.log, offset, commit)) {
                 head_offset = entry->data.head;
                 dare_state &= ~SNAPSHOT;
             }
@@ -2237,8 +2174,8 @@ poll_config_entries()
         /* Advance offset */
         offset += log_entry_len(entry);
     }
-    if (log_is_offset_larger(data.log, offset, write)) {
-        data.config.cid_offset = write;
+    if (log_is_offset_larger(data.log, offset, commit)) {
+        data.config.cid_offset = commit;
     }
     else {
         data.config.cid_offset = offset;
@@ -2284,7 +2221,7 @@ update_cid( dare_cid_t cid )
                 dare_server_shutdown();
             }
             dare_ib_disconnect_server(i);
-            info_wtime(log_fp, "REMOVE SERVER #%"PRIu8"\n", i);
+            info_wtime(log_fp, "REMOVE SERVER p%"PRIu8"\n", i);
         }
     }
     data.config.cid = cid;
@@ -2573,14 +2510,16 @@ info(log_fp, "   # (%i) RDMA %s: o = %lf usecs\n\n", i, (write ? "Write" : "Read
 /* Others */
 #if 1
 
-void server_sid_modified()
-{
-    /* SID modified; somebody is alive */
-        
-    /* Restart HB mechanism in receive mode */
-    ev_set_cb(&hb_event, hb_receive_cb);
-    hb_event.repeat = hb_timeout();
-    ev_timer_again(data.loop, &hb_event);
+/**
+ * Transit server to follower state 
+ */
+void server_to_follower()
+{   
+    int rc;
+
+    /* Stop HB mechanism for the moment ... */
+    hb_event.repeat = 0.;
+    ev_timer_again(data.loop, &hb_event); 
     
     /* Stop log pruning */
     prune_event.repeat = 0.;
@@ -2602,18 +2541,35 @@ void server_sid_modified()
             
     /* Restore log access according to the new term */
     dare_ib_restore_log_access();
+    
+    if (SID_GET_L(data.ctrl_data->sid)) {
+        /* New leader; send vote ACK to notify it that the log is accessible */
+        info_wtime(log_fp, "Send vote ACK to notify p%"PRIu8" that my log is accessible\n", SID_GET_IDX(data.ctrl_data->sid));
+        rc = dare_ib_send_vote_ack();
+        if (rc < 0) {
+            /* Operation failed; start an election */
+            start_election(); 
+            return;
+        }
+        if (0 != rc) {
+            /* This should never happen */
+            error_exit(1, log_fp, "Cannot send vote ack\n");
+        }
+    }
+    
+    /* Restart HB mechanism in receive mode */
+    ev_set_cb(&hb_event, hb_receive_cb);
+    hb_event.repeat = hb_timeout();
+    ev_timer_again(data.loop, &hb_event);
 }
 
 int server_update_sid( uint64_t new_sid, uint64_t old_sid )
 {
     int rc;
     rc = __sync_bool_compare_and_swap(&(data.ctrl_data->sid),
-                                    old_sid,
-                                    new_sid);
+                                    old_sid, new_sid);
     if (!rc) {
-        debug(log_fp, "CAS failed\n");
-        server_sid_modified();
-        return 1;
+        error_exit(1, log_fp, "CAS failed\n");
     }
     return 0;
 }
@@ -2627,7 +2583,7 @@ int is_leader()
 static void 
 int_handler(int dummy) 
 {
-    fprintf(log_fp,"SIGINT detected; shutdown\n");
+    info_wtime(log_fp,"SIGINT detected; shutdown\n");
     //dare_server_shutdown();
     dare_state |= TERMINATE;
 }

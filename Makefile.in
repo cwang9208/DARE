@@ -8,7 +8,7 @@ CC = gcc
 
 FLAGS        = -std=gnu99 -I./include -I./utils/rbtree/include #IBV_INCLUDE#
 CFLAGS       = #-Wall -Wunused-function #-Wextra
-LDFLAGS      = -lpthread -lm -lrt #IBV_LIB#
+LDFLAGS      = #IBV_LIB#
 
 PREFIX  = #PREFIX#
 LIBPATH = $(PREFIX)/lib
@@ -46,43 +46,70 @@ RESIZE_TRACE = $(BINDIR)/resize_trace
 
 all: dare test trace
 
-$(RBTREE): $(RBTREE_OBJS) $(RBTREE_HEADERS)
+$(RBTREE): rbtree_print $(RBTREE_OBJS) $(RBTREE_HEADERS)
 	mkdir -pm 755 $(LIBPATH)
 	ar -rcs $@ $(RBTREE_OBJS)
+	@echo "##############################"
+	@echo
+rbtree_print:
+	@echo "##### BUILDING Red-Black Tree #####"
 	
 dare: FLAGS += #EV_INCLUDE#
 dare: LDFLAGS += #EV_LIB#
 dare: $(DARE) 
-$(DARE): $(OBJS) $(HEADERS) $(RBTREE)
+$(DARE): $(RBTREE) dare_print $(OBJS) $(HEADERS) 
 	mkdir -pm 755 $(LIBPATH)
 	ar -rcs $@ $(OBJS) $(RBTREE_OBJS)
-	
+	@echo "##############################"
+	@echo
+dare_print:
+	@echo "##### BUILDING DARE #####"
+
 test: FLAGS += #EV_INCLUDE#
 test: LDFLAGS +=  -L$(LIBPATH) -ldare #EV_LIB#
 test: $(SRV_TEST) $(CLT_TEST) $(MPI_LAUNCH)
-$(SRV_TEST): $(SRV_TEST_OBJS) $(HEADERS) $(DARE)
+$(SRV_TEST): srv_test_print $(SRV_TEST_OBJS) $(HEADERS) $(DARE)
 	mkdir -pm 755 $(BINDIR)
 	$(CC) $(FLAGS) $(CFLAGS) -o $(SRV_TEST) $(SRV_TEST_OBJS) $(LDFLAGS)
-$(CLT_TEST): $(CLT_TEST_OBJS) $(HEADERS) $(DARE)
+	@echo "##############################"
+	@echo
+srv_test_print:
+	@echo "##### BUILDING Server #####"
+
+$(CLT_TEST): clt_test_print $(CLT_TEST_OBJS) $(HEADERS) $(DARE)
 	mkdir -pm 755 $(BINDIR)
 	$(CC) $(FLAGS) $(CFLAGS) -o $(CLT_TEST) $(CLT_TEST_OBJS) $(LDFLAGS)
-$(MPI_LAUNCH):
+	@echo "##############################"
+	@echo
+clt_test_print:
+	@echo "##### BUILDING Client #####"
+
+$(MPI_LAUNCH): mpi_launch_print
 	mkdir -pm 755 $(BINDIR)
 	mpicc $(MPI_LAUNCH_SRCS) -o $(MPI_LAUNCH)
+	@echo "##############################"
+	@echo
+mpi_launch_print:
+	@echo "##### BUILDING MPI Launcher #####"
 	
 trace: LDFLAGS +=  -L$(LIBPATH) -ldare
-trace: $(KVS_TRACE) $(RESIZE_TRACE)
+trace: trace_print $(KVS_TRACE) $(RESIZE_TRACE)
 $(KVS_TRACE): $(KVS_TRACE_OBJS) $(HEADERS) $(DARE)
 	mkdir -pm 755 $(BINDIR)
 	$(CC) $(FLAGS) $(CFLAGS) -o $(KVS_TRACE) $(KVS_TRACE_OBJS) $(LDFLAGS)
 $(RESIZE_TRACE): $(RESIZE_TRACE_OBJS) $(HEADERS) $(DARE)
 	mkdir -pm 755 $(BINDIR)
 	$(CC) $(FLAGS) $(CFLAGS) -o $(RESIZE_TRACE) $(RESIZE_TRACE_OBJS) $(LDFLAGS)	
+	@echo "##############################"
+	@echo
+trace_print:
+	@echo "##### BUILDING Trace Generators #####"
 		
 debug: FLAGS += -DDEBUG -g -O0
 debug: dare test trace
 
 clean:
+	@echo "##### CLEAN-UP #####"
 	-rm -f $(SRV_TEST_OBJS)
 	-rm -f $(CLT_TEST_OBJS)
 	-rm -f $(KVS_TRACE_OBJS) $(RESIZE_TRACE_OBJS)
@@ -90,6 +117,8 @@ clean:
 	-rm -f $(OBJS)
 	-rm -f $(SRV_TEST) $(CLT_TEST) $(KVS_TRACE) $(RESIZE_TRACE) $(DARE) $(RBTREE)
 	-rm -f $(MPI_LAUNCH) 
+	@echo "####################"
+	@echo
 	 
 distclean: clean
 	-rm -f Makefile

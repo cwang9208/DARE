@@ -3,9 +3,12 @@
  *
  * Test code for a server
  *
+ * Copyright (c) 2016 HLRS, University of Stuttgart. All rights reserved.
+ * 
  * Copyright (c) 2014-2015 ETH-Zurich. All rights reserved.
  * 
  * Author(s): Marius Poke <marius.poke@inf.ethz.ch>
+ *            Nakul Vyas <mailnakul@gmail.com>
  * 
  */
 
@@ -18,11 +21,11 @@
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
 #include <getopt.h>
-
 #include <dare_server.h>
 #include <dare_ibv.h>
 
 FILE *log_fp;
+extern char* global_mgid;
 
 void usage( char *prog )
 {
@@ -34,8 +37,9 @@ void usage( char *prog )
             "\t-s <size>                                (group size; default 3)\n"
             "\t-i <index>                               (server's index)\n"
             "\t-o <output>                              (output file)\n"
-            "\t-l <log>                                 (log file)\n.",
-            prog);
+            "\t-l <log>                                 (log file)\n"
+            "\t-m <mgid>                                (Global Multicast ID)\n"  
+            ,prog);
 }
 int main(int argc, char* argv[])
 {
@@ -71,10 +75,11 @@ int main(int argc, char* argv[])
             {"index", required_argument, 0, 'i'},
             {"output", required_argument, 0, 'o'},
             {"log", required_argument, 0, 'l'},
+            {"MGID",required_argument, 0,'m'},
             {0, 0, 0, 0}
         };
         int option_index = 0;
-        c = getopt_long (argc, argv, "hn:s:i:o:l:",
+        c = getopt_long (argc, argv, "hnm:s:i:o:l:",
                        long_options, &option_index);
         /* Detect the end of the options. */
         if (c == -1) break;
@@ -99,8 +104,8 @@ int main(int argc, char* argv[])
                 break;
                 
             case 's':
-                input.group_size = (uint8_t)atoi(optarg);
-                break;
+               input.group_size = (uint8_t)atoi(optarg);
+               break;
                 
             case 'i':
                 input.server_idx = (uint8_t)atoi(optarg);
@@ -115,6 +120,11 @@ int main(int argc, char* argv[])
                 break;
 
             case '?':
+                usage(argv[0]);
+                break;
+
+            case 'm': 
+                global_mgid = optarg;
                 break;
 
             default:
@@ -126,7 +136,7 @@ int main(int argc, char* argv[])
 
     if (strcmp(log_file, "") != 0) {
         input.log = fopen(log_file, "w+");
-        if (NULL == input.log) {
+        if (input.log==NULL) {
             printf("Cannot open log file\n");
             exit(1);
         }

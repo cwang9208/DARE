@@ -24,6 +24,8 @@
 #define CONFIG  2
 #define HEAD    3
 
+extern int prev_log_entry_head;
+
 /* Entry types: <CSM, cmd> 
  *              OR <CONFIG, cid> 
  *              OR <NOOP, __ >
@@ -62,8 +64,8 @@ typedef struct dare_nc_buf_t dare_nc_buf_t;
 
 struct log_offsets_t {
     uint64_t head;
-    uint64_t read;
-    uint64_t write;
+    uint64_t apply;
+    uint64_t commit;
     uint64_t end;
 };
 typedef struct log_offsets_t log_offsets_t;
@@ -74,10 +76,10 @@ struct dare_log_t
 {
     uint64_t head;  /* offset of the first entry;
                     minimum applied index in the cluster */
-    uint64_t read;  /* offset of the first not applied entry 
-                    the server applies all entries from read to write */
-    uint64_t write; /* offset of the first not committed entry 
-                    the leader overlaps all entries from write to end of 
+    uint64_t apply;  /* offset of the first not applied entry 
+                    the server applies all entries from apply to commit */
+    uint64_t commit; /* offset of the first not committed entry 
+                    the leader overlaps all entries from commit to end of 
                     its own log */
     uint64_t end;  /* offset after the last entry; 
                     if end==len the buffer is empty;
@@ -98,7 +100,7 @@ typedef struct dare_log_t dare_log_t;
 /* Snapshot of a generic SM */
 #define PREREG_SNAPSHOT_SIZE 128*PAGE_SIZE
 struct snapshot_t {
-    dare_log_entry_det_t last_entry;    /* The last apply entry */
+    dare_log_entry_det_t last_entry;    /* The last applied entry */
     uint32_t len;                       /* Length of data */
     char data[0];                       /* SM specific data */
 };
@@ -170,7 +172,7 @@ is_log_full( dare_log_t* log )
 static inline int 
 not_committed_entries( dare_log_t* log )
 {
-    return (!is_log_empty(log) && (log->write != log->end));
+    return (!is_log_empty(log) && (log->commit != log->end));
 }
 
 /**
@@ -181,7 +183,7 @@ not_committed_entries( dare_log_t* log )
 static inline int 
 not_applied_entries( dare_log_t* log )
 {
-    return (!is_log_empty(log) && (log->read != log->write));
+    return (!is_log_empty(log) && (log->apply != log->commit));
 }
 
 /** 
@@ -276,22 +278,22 @@ log_is_offset_larger( dare_log_t* log,
 #define TEXT_PRINT_LOG(stream, log_ptr) \
     text(stream, "#LOG [len=%"PRIu64"]: " \
                  "head=%"PRIu64 \
-                 "; read=%"PRIu64 \
-                 "; write=%"PRIu64 \
+                 "; apply=%"PRIu64 \
+                 "; commit=%"PRIu64 \
                  "; tail=%"PRIu64 \
                  "; end=%"PRIu64"\n", \
                  (log_ptr)->len, (log_ptr)->head, \
-                 (log_ptr)->read, (log_ptr)->write,\
+                 (log_ptr)->apply, (log_ptr)->commit,\
                  (log_ptr)->tail, (log_ptr)->end);
 #define INFO_PRINT_LOG(stream, log_ptr) \
     info(stream, "LOG [%"PRIu64"]: " \
                  "h=%"PRIu64 \
-                 "; r=%"PRIu64 \
-                 "; w=%"PRIu64 \
+                 "; a=%"PRIu64 \
+                 "; c=%"PRIu64 \
                  "; t=%"PRIu64 \
                  "; e=%"PRIu64"\n", \
                  (log_ptr)->len, (log_ptr)->head, \
-                 (log_ptr)->read, (log_ptr)->write,\
+                 (log_ptr)->apply, (log_ptr)->commit,\
                  (log_ptr)->tail, (log_ptr)->end);
                  
                  
@@ -331,7 +333,7 @@ static void
 log_entries_to_nc_buf( dare_log_t* log, dare_nc_buf_t* nc_buf )
 {
     dare_log_entry_t *entry;
-    uint64_t offset = log->write;
+    uint64_t offset = log->commit;
     uint64_t len = 0;
     
     while ( (entry = log_get_entry(log, &offset)) != NULL ) {
@@ -403,8 +405,8 @@ log_get_tail( dare_log_t* log )
     dare_log_entry_t* entry;
     uint64_t offset, tail = log->len;
     
-    /* Try to find the tail starting from the write offset */
-    offset = log->write;
+    /* Try to find the tail starting from the commit offset */
+    offset = log->commit;
     while ( (entry = log_get_entry(log, &offset)) != NULL ) {
         tail = offset;
         if (!log_fit_entry(log, offset, entry)) {
@@ -418,8 +420,8 @@ log_get_tail( dare_log_t* log )
         return tail;
     }
     
-    /* Try to find the tail starting from the read offset */
-    offset = log->read;
+    /* Try to find the tail starting from the apply offset */
+    offset = log->apply;
     while ( (entry = log_get_entry(log, &offset)) != NULL ) {
         tail = offset;
         if (!log_fit_entry(log, offset, entry)) {
@@ -465,6 +467,10 @@ log_append_entry( dare_log_t* log,
     sm_cmd_t *cmd = (sm_cmd_t*)data;
     dare_cid_t *cid = (dare_cid_t*)data;
     uint64_t *head = (uint64_t*)data;
+    if (type != HEAD) {
+        /* Avoid double HEAD */
+        prev_log_entry_head = 0;
+    }
 
     /* Compute new index */
     if (log->tail == log->len) {
@@ -493,6 +499,7 @@ log_append_entry( dare_log_t* log,
     switch(type) {
         case CSM:
         {
+//info(log_fp, "### add log entry CSM\n");
             entry->data.cmd.len = cmd->len;
             if (!log_fit_entry(log, log->end, entry)) {
                 /* Not enough place for an entry (with the command) */
@@ -516,12 +523,15 @@ log_append_entry( dare_log_t* log,
             break;
         }
         case CONFIG:
+//info(log_fp, "### add log entry CONFIG\n");
             entry->data.cid = *cid;
             break;
         case HEAD:
+//info(log_fp, "### add log entry HEAD\n");
             entry->data.head = *head;
             break;
         case NOOP:
+//info(log_fp, "### add log entry NOOP\n");
             break;
     }
     /* Set new tail (offset of last entry) */

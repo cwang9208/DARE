@@ -61,14 +61,14 @@ static int
 rc_qp_init_to_rtr( dare_ib_ep_t *ep, int qp_id );
 static int 
 rc_qp_rtr_to_rts( dare_ib_ep_t *ep, int qp_id );
+static int 
+rc_qp_reset_to_rts(dare_ib_ep_t *ep, int qp_id);
 static int
 rc_qp_reset( dare_ib_ep_t *ep, int qp_id );
 static int 
 rc_qp_reset_to_init( dare_ib_ep_t *ep, int qp_id );
 static int 
 rc_qp_restart( dare_ib_ep_t *ep, int qp_id );
-static int 
-rc_connect_server_partially( uint8_t idx, int qp_id );
 static int 
 post_send( uint8_t server_id, 
            int qp_id,
@@ -428,7 +428,7 @@ int rc_get_replicated_vote()
             posted_sends[i] = -1;  // insuccess
             continue;
         }
-        text(log_fp, "   (server#%"PRIu8")\n", i);
+        text(log_fp, "   (p%"PRIu8")\n", i);
         
         rem_mem_t rm;
         rm.raddr = ep->rc_ep.rmt_mr[CTRL_QP].raddr + offset;
@@ -466,9 +466,8 @@ int rc_get_replicated_vote()
         }
     }
     /* Update the cache SID */
-    SRV_DATA->cached_sid = SRV_DATA->ctrl_data->sid;
     text(log_fp, "SID after getting the replicated vote:"); 
-    PRINT_SID_(SRV_DATA->cached_sid);
+    PRINT_SID_(SRV_DATA->ctrl_data->sid);
     
     return 0;
 }
@@ -501,7 +500,7 @@ int rc_send_sm_request()
         if (0 == ep->rc_connected) {
             continue;
         }
-        text(log_fp, "   (server#%"PRIu8")\n", i);
+        text(log_fp, "   (p%"PRIu8")\n", i);
         
         rm.raddr = ep->rc_ep.rmt_mr[CTRL_QP].raddr + offset;
         rm.rkey = ep->rc_ep.rmt_mr[CTRL_QP].rkey;
@@ -575,7 +574,7 @@ int rc_send_sm_reply( uint8_t target, void *s, int reg_mem )
     }
     ssn++;  // increase ssn to avoid past work completions
     TIMER_START(log_fp, "Send SM reply (%"PRIu64")\n", ssn); 
-    text(log_fp, "   (server#%"PRIu8")\n", target);
+    text(log_fp, "   (p%"PRIu8")\n", target);
         
     rm.raddr = ep->rc_ep.rmt_mr[CTRL_QP].raddr + offset;
     rm.rkey = ep->rc_ep.rmt_mr[CTRL_QP].rkey;
@@ -597,7 +596,9 @@ int rc_send_sm_reply( uint8_t target, void *s, int reg_mem )
  * Server recovery: Get the SM of a random picked server referred to 
  * as the target. For this, the target must dump it's SM in a contiguous 
  * buffer that is accessible through RDMA. The SM contains the offset of 
- * the last applied entry; thus, lcl.r = SM.r
+ * the last applied entry; thus, lcl.apply = SM.apply
+ * 
+ * !!! Note: to avoid connecting the LOG QPs, we use the CTRL QP
  */
 int rc_recover_sm( uint8_t target )
 {
@@ -606,16 +607,7 @@ int rc_recover_sm( uint8_t target )
     uint8_t i, size = get_group_size(SRV_DATA->config);
     int posted_sends[MAX_SERVER_COUNT];
     TIMER_INIT;
-    
-    /* Update log access; get exclusive access to local log */
-    rc_revoke_log_access();
-    for (i = 0; i < size; i++) {
-        if (i == SRV_DATA->config.idx) continue;
-        rc_connect_server_partially(i, LOG_QP);
-    }
-    info_wtime(log_fp, "RESTORE partial log access T%"PRIu64"\n", 
-            SID_GET_TERM(SRV_DATA->cached_sid));
-    
+       
     /* Set local memory where to store the SM snapshot */
     snapshot_t *snapshot;
     struct ibv_mr *lcl_mr;
@@ -660,13 +652,15 @@ int rc_recover_sm( uint8_t target )
     }
     ssn++;  // increase ssn to avoid past work completions
     TIMER_START(log_fp, "Recover SM (%"PRIu64")\n", ssn); 
-    text(log_fp, "   (server#%"PRIu8")\n", target);    
+    text(log_fp, "   (p%"PRIu8")\n", target);    
+    
+    info(log_fp, "   # recover snapshot from p%"PRIu8"\n", target);    
     
     rm.raddr = SRV_DATA->ctrl_data->sm_rep[target].raddr;
     rm.rkey = SRV_DATA->ctrl_data->sm_rep[target].rkey;
     posted_sends[target] = 1;
     /* server_id, qp_id, buf, len, mr, opcode, signaled, rm, posted_sends */ 
-    rc = post_send(target, LOG_QP, snapshot,
+    rc = post_send(target, CTRL_QP, snapshot,
                     SRV_DATA->ctrl_data->sm_rep[target].len, 
                     lcl_mr, IBV_WR_RDMA_READ, SIGNALED, rm, posted_sends);
     if (0 != rc) {
@@ -674,8 +668,9 @@ int rc_recover_sm( uint8_t target )
         error_return(RC_ERROR, log_fp, "Cannot post send operation\n");
     }
     TIMER_STOP(log_fp);
+    info(log_fp, "   # waiting for snapshot\n");
     
-    rc = wait_for_one(posted_sends, LOG_QP);
+    rc = wait_for_one(posted_sends, CTRL_QP);
     if (RC_ERROR == rc) {
         /* This should never happen */
         error_return(1, log_fp, "Cannot get log entries\n");
@@ -692,9 +687,9 @@ int rc_recover_sm( uint8_t target )
     if (0 != rc) {
         error_return(1, log_fp, "Cannot apply SM snapshot\n");
     }
-    SRV_DATA->log->read = snapshot->last_entry.offset;
+    SRV_DATA->log->apply = snapshot->last_entry.offset;
     
-    info(log_fp, "   # snapshot applied; read = %"PRIu64"\n", SRV_DATA->log->read);
+    info(log_fp, "   # snapshot applied; apply = %"PRIu64"\n", SRV_DATA->log->apply);
     
     /* Free allocated memory if needed */
     if (SRV_DATA->ctrl_data->sm_rep[target].len > PREREG_SNAPSHOT_SIZE) {
@@ -717,14 +712,17 @@ int rc_recover_sm( uint8_t target )
 
 /**
  * Server recovery:
- *  - Get the write and the end offsets from a server; 
- * lcl.h <= any rmt.r <= any rmt.w; also, lcl.h < any rmt.e; thus, to 
+ *  - Get the commit and the end offsets from a server; 
+ * lcl.head <= any rmt.apply <= any rmt.commit; 
+ * also, lcl.head < any rmt.end; thus, to 
  * be sure that we get at least an entry from the log, we need to read 
- * both the write and the end offsets
+ * both the commit and the end offsets
  *  - Get (from the target) the log entries between the head and 
  *    the end offsets.
- *  - Set end offset to the write offset: lcl.e = lcl.w
- * Note: lcl.h was set when the server receives a reply for the JOIN req
+ *  - Set end offset to the commit offset: lcl.end = lcl.commit
+ * Note: lcl.head was set when the server receives a reply for the JOIN req
+ * 
+ * !!! Note: to avoid connecting the LOG QPs, we use the CTRL QP
  */
 int rc_recover_log()
 {
@@ -738,12 +736,12 @@ int rc_recover_log()
     TIMER_INIT;
 
     /**
-     * Get the write and end offset from a server
+     * Get the commit and end offset from a server
      */
-    offset = (uint32_t) (offsetof(dare_log_t, write));
+    offset = (uint32_t) (offsetof(dare_log_t, commit));
     memset(posted_sends, 0, MAX_SERVER_COUNT*sizeof(int));
     ssn++;  // increase ssn to avoid past work completions
-    TIMER_START(log_fp, "Get remote write offset (%"PRIu64")\n", ssn); 
+    TIMER_START(log_fp, "Get remote commit, end offsets (%"PRIu64")\n", ssn); 
     for (i = 0; i < size; i++) {
         if ( (i == SRV_DATA->config.idx) || 
             !CID_IS_SERVER_ON(SRV_DATA->config.cid, i) )
@@ -757,14 +755,14 @@ int rc_recover_log()
             posted_sends[i] = -1;  // insuccess
             continue;
         }
-        text(log_fp, "   (server#%"PRIu8")\n", i);
+        text(log_fp, "   (p%"PRIu8")\n", i);
         
         rm.raddr = ep->rc_ep.rmt_mr[LOG_QP].raddr + offset;
         rm.rkey = ep->rc_ep.rmt_mr[LOG_QP].rkey;
         posted_sends[i] = 1;
         /* server_id, qp_id, buf, len, mr, opcode, signaled, rm, posted_sends */ 
-        rc = post_send(i, LOG_QP, 
-                        &SRV_DATA->ctrl_data->log_offsets[i].write,
+        rc = post_send(i, CTRL_QP, 
+                        &SRV_DATA->ctrl_data->log_offsets[i].commit,
                         2*sizeof(uint64_t), IBDEV->lcl_mr[CTRL_QP],
                         IBV_WR_RDMA_READ, SIGNALED, rm, posted_sends);
         if (0 != rc) {
@@ -775,7 +773,7 @@ int rc_recover_log()
     TIMER_STOP(log_fp);
     
     /* Wait just for one since any one will do */
-    rc = wait_for_one(posted_sends, LOG_QP);
+    rc = wait_for_one(posted_sends, CTRL_QP);
     if (RC_ERROR == rc) {
         /* This should never happen */
         error_return(1, log_fp, "Cannot read log info\n");
@@ -785,7 +783,7 @@ int rc_recover_log()
         return -1;
     }
     
-    /* Find the target: the successful operation */
+    /* Find the target, i.e., one successful operation */
     for (target = 0; target < size; target++) {
         if (0 == posted_sends[target]) {
             break;
@@ -810,12 +808,12 @@ int rc_recover_log()
         rmt_offsets->end = 0;
     }
     if (log_is_offset_larger(SRV_DATA->log, 
-            rmt_offsets->write, rmt_offsets->end))
+            rmt_offsets->commit, rmt_offsets->end))
     {
-        rmt_offsets->write = rmt_offsets->end;
+        rmt_offsets->commit = rmt_offsets->end;
     }
     SRV_DATA->log->end = rmt_offsets->end;
-    SRV_DATA->log->write = rmt_offsets->write;
+    SRV_DATA->log->commit = rmt_offsets->commit;
     
     /* Get the log entries between the head and the end offsets */
     offset = (uint32_t)(offsetof(dare_log_t, entries) 
@@ -829,14 +827,14 @@ int rc_recover_log()
     }
     ssn++;  // increase ssn to avoid past work completions
     TIMER_START(log_fp, "Recover LOG (%"PRIu64")\n", ssn); 
-    text(log_fp, "   (server#%"PRIu8")\n", target);    
+    text(log_fp, "   (p%"PRIu8")\n", target);    
     
     ep = (dare_ib_ep_t*)SRV_DATA->config.servers[target].ep;
     rm.raddr = ep->rc_ep.rmt_mr[LOG_QP].raddr + offset;
     rm.rkey = ep->rc_ep.rmt_mr[LOG_QP].rkey;
     posted_sends[target] = 1;
     /* server_id, qp_id, buf, len, mr, opcode, signaled, rm, posted_sends */ 
-    rc = post_send(target, LOG_QP, SRV_DATA->log->entries + SRV_DATA->log->head,
+    rc = post_send(target, CTRL_QP, SRV_DATA->log->entries + SRV_DATA->log->head,
                     len, IBDEV->lcl_mr[LOG_QP],
                     IBV_WR_RDMA_READ, SIGNALED, rm, posted_sends);
     if (0 != rc) {
@@ -845,7 +843,7 @@ int rc_recover_log()
     }
     TIMER_STOP(log_fp);
     
-    rc = wait_for_one(posted_sends, LOG_QP);
+    rc = wait_for_one(posted_sends, CTRL_QP);
     if (RC_ERROR == rc) {
         /* This should never happen */
         error_return(1, log_fp, "Cannot get log entries\n");
@@ -895,7 +893,7 @@ int rc_send_hb()
         if (0 == ep->rc_connected) {
             continue;
         }
-        //text(log_fp, "   (server#%"PRIu8")\n", i);
+        //text(log_fp, "   (p%"PRIu8")\n", i);
         
         rem_mem_t rm;
         rm.raddr = ep->rc_ep.rmt_mr[CTRL_QP].raddr + offset;
@@ -941,7 +939,7 @@ int rc_send_hb_reply( uint8_t idx )
     if (0 == ep->rc_connected) {
         return 0;
     }
-    text(log_fp, "   (server#%"PRIu8")\n", idx);
+    text(log_fp, "   (p%"PRIu8")\n", idx);
         
     rem_mem_t rm;
     rm.raddr = ep->rc_ep.rmt_mr[CTRL_QP].raddr + offset;
@@ -981,7 +979,7 @@ int rc_send_vote_request()
     
     /* Set vote request */
     vote_req_t *request = &(SRV_DATA->ctrl_data->vote_req[idx]);
-    request->sid = SRV_DATA->cached_sid;
+    request->sid = SRV_DATA->ctrl_data->sid;
     if (is_log_empty(SRV_DATA->log)) {
         /* The log is empty */
         request->index = 0;
@@ -1017,7 +1015,7 @@ int rc_send_vote_request()
             //posted_sends[i] = -1;  // insuccess
             continue;
         }
-        text(log_fp, "   (server#%"PRIu8")\n", i);
+        text(log_fp, "   (p%"PRIu8")\n", i);
         
         /* Set address and key of remote memory region */
         rm.raddr = ep->rc_ep.rmt_mr[CTRL_QP].raddr + offset;
@@ -1047,7 +1045,6 @@ int rc_send_vote_request()
 
 /**
  * Replicate SID of a the candidate that receives my vote;
- * already updated cached SID ... 
  * future SIDs of this index cannot be lower than the replicated SID
  */
 int rc_replicate_vote()
@@ -1063,7 +1060,7 @@ int rc_replicate_vote()
 
     /* Set vote_sid in the private data */
     uint64_t *vsid = &SRV_DATA->ctrl_data->prv_data[idx].vote_sid;
-    *vsid = SRV_DATA->cached_sid;
+    *vsid = SRV_DATA->ctrl_data->sid;
     
     /* Compute offset for RDMA write */
     uint32_t offset = (uint32_t) (offsetof(ctrl_data_t, prv_data) 
@@ -1084,7 +1081,7 @@ int rc_replicate_vote()
             posted_sends[i] = -1;  // insuccess
             continue;
         }
-        text(log_fp, "   (server#%"PRIu8")\n", i);
+        text(log_fp, "   (p%"PRIu8")\n", i);
         
         /* Set address and key of remote memory region */
         rm.raddr = ep->rc_ep.rmt_mr[CTRL_QP].raddr + offset;
@@ -1114,7 +1111,7 @@ int rc_replicate_vote()
 
 /**
  * Send vote ACK to the candidate
- * The ACK is the local write offset 
+ * The ACK is the local commit offset 
  * Note: the ack may or may not reach the destination
  */
 int rc_send_vote_ack()
@@ -1122,7 +1119,7 @@ int rc_send_vote_ack()
     int rc, i;
     dare_ib_ep_t *ep;
     rem_mem_t rm;
-    uint8_t candidate = SID_GET_IDX(SRV_DATA->cached_sid);
+    uint8_t candidate = SID_GET_IDX(SRV_DATA->ctrl_data->sid);
     uint8_t idx = SRV_DATA->config.idx;
     int posted_sends[MAX_SERVER_COUNT];
 
@@ -1149,9 +1146,9 @@ int rc_send_vote_ack()
     }
     posted_sends[candidate] = 1;
     ssn++;
-    text(log_fp, "Send vote ACK (server#%"PRIu8",%"PRIu64")\n", candidate, ssn);
+    text(log_fp, "Send vote ACK to p%"PRIu8" (%"PRIu64")\n", candidate, ssn);
     /* server_id, qp_id, buf, len, mr, opcode, signaled, rm, posted_sends */ 
-    rc = post_send(candidate, CTRL_QP, &SRV_DATA->log->write, 
+    rc = post_send(candidate, CTRL_QP, &SRV_DATA->log->commit, 
                     sizeof(uint64_t), IBDEV->lcl_mr[LOG_QP], 
                     IBV_WR_RDMA_WRITE, SIGNALED, rm, posted_sends); 
     if (0 != rc) {
@@ -1217,7 +1214,7 @@ int rc_verify_leadership( int *leader )
             posted_sends[i] = -1;  // insuccess
             continue;
         }
-        text(log_fp, "   (server#%"PRIu8")\n", i);
+        text(log_fp, "   (p%"PRIu8")\n", i);
         
         /* Set address and key of remote memory region */
         rm.raddr = ep->rc_ep.rmt_mr[CTRL_QP].raddr + offset;
@@ -1246,7 +1243,7 @@ int rc_verify_leadership( int *leader )
     /**
      * Check remote SIDs to see if there is a better one 
      */
-    uint64_t new_sid = SRV_DATA->cached_sid;   
+    uint64_t new_sid = SRV_DATA->ctrl_data->sid;   
     for (i = 0; i < size; i++) {
         if (i == SRV_DATA->config.idx) {
             continue;
@@ -1266,16 +1263,16 @@ int rc_verify_leadership( int *leader )
             }
         }
     }
-    if (new_sid != SRV_DATA->cached_sid) {
+    if (new_sid != SRV_DATA->ctrl_data->sid) {
         /* A better leader was found */
         *leader = 0;
-        rc = server_update_sid(new_sid, SRV_DATA->cached_sid);
+        rc = server_update_sid(new_sid, SRV_DATA->ctrl_data->sid);
         if (0 != rc) {
             /* Cannot update SID - go back to follower state */
             return 0;
         }
         /* SID modified: go to follower state */
-        server_sid_modified();
+        server_to_follower();
         return 0;
     }
     *leader = 1;
@@ -1285,9 +1282,9 @@ int rc_verify_leadership( int *leader )
 
 /**
  * Log adjustment phase
- *  - read the remote write offset (note that if the remote server has 
+ *  - read the remote commit offset (note that if the remote server has 
  * no not committed entries, we need to set the end offset to the 
- * remote write offset)
+ * remote commit offset)
  *  - read the number of not committed entries
  *  - read the not committed entries
  *  - find offset of first non-matching entry and update remote end offset
@@ -1306,7 +1303,7 @@ log_adjustment()
     rem_mem_t rm;        
     uint8_t i, size;
     uint32_t offset;
-    uint64_t remote_write, *remote_end;
+    uint64_t remote_commit, *remote_end;
     dare_nc_buf_t *nc_buf;
     TIMER_INIT;
     
@@ -1336,8 +1333,8 @@ log_adjustment()
             /* No RC data for this endpoint */
             continue;
         }
-        remote_write = SRV_DATA->ctrl_data->vote_ack[i];
-        if (SRV_DATA->log->len == remote_write) {
+        remote_commit = SRV_DATA->ctrl_data->vote_ack[i];
+        if (SRV_DATA->log->len == remote_commit) {
             /* No vote ACK from this server */
             continue;
         }
@@ -1350,22 +1347,10 @@ log_adjustment()
         /* Check in what state of log adjustment is this server */
         switch(server->next_lr_step) {
             case LR_GET_WRITE: 
-            { /* Step I: Read the remote write offset */
-                //TIMER_INFO(log_fp, "   (server#%"PRIu8": get write offset)\n", i);
-#if 0                
-                /* Set remote offset */
-                offset = (uint32_t) (offsetof(dare_log_t, write));
-                /* Set send fields */
-                local_buf = &SRV_DATA->ctrl_data->log_offsets[i].write;
-                local_buf_len = sizeof(uint64_t);
-                local_mr = IBDEV->lcl_mr[CTRL_QP];
-                rdma_opcode = IBV_WR_RDMA_READ;
-                break;
-#else
-                /* No need to get the write offset; it comes with the vote ACK */
-                SRV_DATA->ctrl_data->log_offsets[i].write = remote_write;
+            { /* Step I: Read the remote commit offset --
+                 No need to get the commit offset; it comes with the vote ACK */
+                SRV_DATA->ctrl_data->log_offsets[i].commit = remote_commit;
                 server->next_lr_step = LR_GET_NCE_LEN;
-#endif                
             }
             case LR_GET_NCE_LEN:
             { /* Step II.a): Read the number of not committed entries */
@@ -1374,16 +1359,13 @@ log_adjustment()
                  * Note: if we can access the remote logs, we can be sure 
                  * that the remote side already published the buffer with 
                  * non committed entries */
-                TIMER_INFO(log_fp, "   (server#%"PRIu8": get #not committed entries)\n", i);
-                /* Check if the leader should update the local write offset */
-#if 0                     
-                remote_write = SRV_DATA->ctrl_data->log_offsets[i].write;
-#endif                
-                if (log_is_offset_larger(SRV_DATA->log, remote_write,
-                                             SRV_DATA->log->write))
+                TIMER_INFO(log_fp, "   (p%"PRIu8": get #not-committed entries)\n", i);
+                /* Check if the leader should update the local commit offset */
+                if (log_is_offset_larger(SRV_DATA->log, remote_commit,
+                                             SRV_DATA->log->commit))
                 {
-                    /* Update local write */
-                    SRV_DATA->log->write = remote_write;
+                    /* Update local commit */
+                    SRV_DATA->log->commit = remote_commit;
                 }
                 /* Set remote offset */
                 offset = (uint32_t) (offsetof(dare_log_t, nc_buf) 
@@ -1403,13 +1385,13 @@ log_adjustment()
                     /* This server has no not committed entries; 
                      * log adjustment done */
                     SRV_DATA->ctrl_data->log_offsets[i].end = 
-                                SRV_DATA->ctrl_data->log_offsets[i].write;
+                                SRV_DATA->ctrl_data->log_offsets[i].commit;
                     server->next_lr_step = LR_UPDATE_LOG;
-                    TIMER_INFO(log_fp, "   (server#%"PRIu8
+                    TIMER_INFO(log_fp, "   (p%"PRIu8
                             ": all remote entries are committed)\n", i);
                     continue;
                 }
-                TIMER_INFO(log_fp, "   (server#%"PRIu8": get %"PRIu64
+                TIMER_INFO(log_fp, "   (p%"PRIu8": get %"PRIu64
                             " not committed entries)\n", i, nc_buf->len);
                 /* Set remote offset */
                 offset = (uint32_t) (offsetof(dare_log_t, nc_buf) 
@@ -1430,7 +1412,7 @@ log_adjustment()
                 remote_end = &SRV_DATA->ctrl_data->log_offsets[i].end;
                 *remote_end = log_find_remote_end_offset(SRV_DATA->log, 
                                             &SRV_DATA->log->nc_buf[i]);
-                TIMER_INFO(log_fp, "   (server#%"PRIu8
+                TIMER_INFO(log_fp, "   (p%"PRIu8
                     ": set end offset to %"PRIu64")\n", i, *remote_end);
                 /* Set send fields */
                 local_buf = remote_end;
@@ -1493,7 +1475,7 @@ update_remote_logs()
     rem_mem_t rm;
     register uint8_t i, size;
     uint32_t offset;
-    uint64_t *remote_end, *remote_write;
+    uint64_t *remote_end, *remote_commit;
     TIMER_INIT;
 
     //int posted_sends[MAX_SERVER_COUNT];
@@ -1537,9 +1519,9 @@ update_remote_logs()
                 //info_wtime(log_fp, "### Log update (%"PRIu64")\n", ssn);
                 init = 1;
             }
-            TIMER_INFO(log_fp, "   (server#%"PRIu8": write log[%"PRIu64":%"PRIu64"])\n", 
+            TIMER_INFO(log_fp, "   (p%"PRIu8": write log[%"PRIu64":%"PRIu64"])\n", 
                         i, *remote_end, SRV_DATA->log->end);
-            //info(log_fp, "   # (server#%"PRIu8": write log[%"PRIu64":%"PRIu64"])\n", 
+            //info(log_fp, "   # (p%"PRIu8": write log[%"PRIu64":%"PRIu64"])\n", 
             //        i, *remote_end, SRV_DATA->log->end);
             /* Set remote offset */
             offset = (uint32_t)(offsetof(dare_log_t, entries) + *remote_end);
@@ -1579,9 +1561,8 @@ update_remote_logs()
             /* Set the remote end offset to the cached end offset */
             remote_end = &SRV_DATA->ctrl_data->log_offsets[i].end;
             *remote_end = server->cached_end_offset;
-            TIMER_INFO(log_fp, "   (server#%"PRIu8
-                    ": update end offset to %"PRIu64")\n", i, *remote_end);
-            //info(log_fp, "   # (server#%"PRIu8
+            TIMER_INFO(log_fp, "   (p%"PRIu8".end=%"PRIu64")\n", i, *remote_end);
+            //info(log_fp, "   # (p%"PRIu8
             //    ": update end offset to %"PRIu64")\n", i, *remote_end);
             /* Set send fields */
             local_buf[0] = remote_end;
@@ -1607,7 +1588,7 @@ update_remote_logs()
         
         /* Post send operation */
         /* server_id, qp_id, buf, len, mr, opcode, signaled, rm, posted_sends */ 
-        //info(log_fp, "Posting send for #%"PRIu8" %"PRIu32" bytes\n", i, local_buf_len[0]);
+        //info(log_fp, "Posting send for p%"PRIu8" %"PRIu32" bytes\n", i, local_buf_len[0]);
 //if (server->next_lr_step != LR_UPDATE_END) {
 //    HRT_GET_TIMESTAMP(SRV_DATA->t1);
 //}
@@ -1647,7 +1628,7 @@ else {
             
             /* Post send operation */
             /* server_id, qp_id, buf, len, mr, opcode, signaled, rm, posted_sends */ 
-            //info(log_fp, "!!! Posting send for #%"PRIu8" %"PRIu32" bytes\n", i, local_buf_len[1]);
+            //info(log_fp, "!!! Posting send for p%"PRIu8" %"PRIu32" bytes\n", i, local_buf_len[1]);
 #ifndef DEBUG            
             rc = 
 #endif            
@@ -1669,7 +1650,7 @@ else {
 
     /* Find minimum offset that exists on a majority of servers 
      * a.k.a find committed entries */
-    uint64_t min_offset = SRV_DATA->log->write;
+    uint64_t min_offset = SRV_DATA->log->commit;
     int j = 0;
     while(j < 2) {
         int larger_offset_count = 0;
@@ -1684,7 +1665,7 @@ else {
                 (SRV_DATA->config.servers[i].fail_count >= PERMANENT_FAILURE) ||
                 (SRV_DATA->config.servers[i].next_lr_step != LR_UPDATE_LOG) )
             {
-                offsets[i] = SRV_DATA->log->write;
+                offsets[i] = SRV_DATA->log->commit;
                 continue;
             }
             /* Log entries up to the end offset of this server are valid */
@@ -1742,23 +1723,23 @@ info(log_fp, "%s\n", buf);
         j++;
     }
 
-    if (log_is_offset_larger(SRV_DATA->log, min_offset, SRV_DATA->log->write)) {
-    //if (SRV_DATA->log->write < min_offset) {
-        /* Update local write offset... */ 
-        SRV_DATA->log->write = min_offset;
+    if (log_is_offset_larger(SRV_DATA->log, min_offset, SRV_DATA->log->commit)) {
+    //if (SRV_DATA->log->commit < min_offset) {
+        /* Update local commit offset... */ 
+        SRV_DATA->log->commit = min_offset;
 //uint64_t ticks;
 //HRT_GET_ELAPSED_TICKS(SRV_DATA->t1, SRV_DATA->t2, &ticks);
 //info(log_fp, "Write time: %lf; wr_rm_log_cnt=%"PRIu64"\n", 
 //    HRT_GET_USEC(ticks), wr_rm_log_cnt);        
 
         /* ... also, update the local CID offset */
-        SRV_DATA->config.cid_offset = SRV_DATA->log->write;
+        SRV_DATA->config.cid_offset = SRV_DATA->log->commit;
 
         /* And set the commit flag */
         committed = 1;
     }
     
-    /* Try to update the write offsets */
+    /* Try to update the commit offsets */
     for (init = 0, i = 0; i < size; i++) {
         if ( (i == SRV_DATA->config.idx) ||
             !CID_IS_SERVER_ON(SRV_DATA->config.cid, i) )
@@ -1774,28 +1755,27 @@ info(log_fp, "%s\n", buf);
         {
             continue;
         }
-        remote_write = &SRV_DATA->ctrl_data->log_offsets[i].write;
+        remote_commit = &SRV_DATA->ctrl_data->log_offsets[i].commit;
         remote_end = &SRV_DATA->ctrl_data->log_offsets[i].end;
-        if ( (*remote_write == *remote_end) ||  /* No new log entries on this server */
-            (*remote_write == SRV_DATA->log->write) ) /* Remote write offset is up to date */
+        if ( (*remote_commit == *remote_end) ||  /* No new log entries on this server */
+            (*remote_commit == SRV_DATA->log->commit) ) /* Remote commit offset is up to date */
         {
             continue;
         }
-        *remote_write = SRV_DATA->log->write;
-        if (log_is_offset_larger(SRV_DATA->log, *remote_write, *remote_end)) {
+        *remote_commit = SRV_DATA->log->commit;
+        if (log_is_offset_larger(SRV_DATA->log, *remote_commit, *remote_end)) {
             /* The remote log does not contain all the committed entries */
-            *remote_write = *remote_end;
+            *remote_commit = *remote_end;
         }
         if (!init) {
             ssn++;  // increase ssn to avoid past work completions
-            TIMER_START(log_fp, "Lazily update write offsets (%"PRIu64
+            TIMER_START(log_fp, "Lazily update commit offsets (%"PRIu64
                         ")\n", ssn);
-            offset = (uint32_t) (offsetof(dare_log_t, write));
+            offset = (uint32_t) (offsetof(dare_log_t, commit));
             init = 1;
         }
-        TIMER_INFO(log_fp, "   (server#%"PRIu8
-                    ": update write offset to %"PRIu64")\n", 
-                    i, *remote_write);
+        TIMER_INFO(log_fp, "   (p%"PRIu8".commit=%"PRIu64")\n", 
+                    i, *remote_commit);
         
         /* Set remote offset */
         rm.raddr = ep->rc_ep.rmt_mr[LOG_QP].raddr + offset;
@@ -1809,7 +1789,7 @@ sprintf(posted_sends_str, "%s %d-wr", posted_sends_str, i);
 #ifdef DEBUG 
         rc = 
 #endif        
-        post_send(i, LOG_QP, remote_write, sizeof(uint64_t), 
+        post_send(i, LOG_QP, remote_commit, sizeof(uint64_t), 
                         IBDEV->lcl_mr[CTRL_QP], IBV_WR_RDMA_WRITE, 
                         NOTSIGNALED, rm, NULL); 
 #ifdef DEBUG        
@@ -1927,14 +1907,14 @@ cmpfunc_offset( const void *a, const void *b )
 }
 
 /**
- * Get remote read offsets
+ * Get remote apply offsets
  * Note: do not wait for the reads to complete;
  * yet, we must avoid having more than IBDEV->ib_dev_attr.max_qp_rd_atom
  * outstanding read operations 
  */
-int rc_get_remote_reads()
+int rc_get_remote_apply_offsets()
 {
-    int rc, init = 0;
+    int rc, init;
     server_t *server;
     dare_ib_ep_t *ep;
     rem_mem_t rm;
@@ -1947,7 +1927,7 @@ int rc_get_remote_reads()
         if ( (i == SRV_DATA->config.idx) || 
             !CID_IS_SERVER_ON(SRV_DATA->config.cid, i) )
         {
-            SRV_DATA->ctrl_data->read_offsets[i] = SRV_DATA->log->read;
+            SRV_DATA->ctrl_data->apply_offsets[i] = SRV_DATA->log->apply;
             continue;
         }
         
@@ -1972,22 +1952,22 @@ int rc_get_remote_reads()
         }
         if (!init) {
             ssn++;  // increase ssn to avoid past work completions
-            TIMER_START(log_fp, "Get remote read offsets (%"PRIu64")\n", ssn); 
-            //info_wtime(log_fp, "Get remote read offsets (%"PRIu64")\n", ssn); 
-            offset = (uint32_t) (offsetof(dare_log_t, read));
+            TIMER_START(log_fp, "Get remote apply offsets (%"PRIu64")\n", ssn); 
+            //info_wtime(log_fp, "Get remote apply offsets (%"PRIu64")\n", ssn); 
+            offset = (uint32_t) (offsetof(dare_log_t, apply));
             init = 1;
         }
         server->last_get_read_ssn = ssn;
 
-        text(log_fp, "   (server#%"PRIu8")\n", i);
-        //info(log_fp, "   # (server#%"PRIu8") r=%"PRIu64"\n", i, 
-        //    SRV_DATA->ctrl_data->read_offsets[i]);
+        text(log_fp, "   (p%"PRIu8")\n", i);
+        //info(log_fp, "   # (p%"PRIu8") r=%"PRIu64"\n", i, 
+        //    SRV_DATA->ctrl_data->apply_offsets[i]);
     
         rm.raddr = ep->rc_ep.rmt_mr[LOG_QP].raddr + offset;
         rm.rkey = ep->rc_ep.rmt_mr[LOG_QP].rkey;
         
         /* server_id, qp_id, buf, len, mr, opcode, signaled, rm, posted_sends */ 
-        rc = post_send(i, LOG_QP, &SRV_DATA->ctrl_data->read_offsets[i],
+        rc = post_send(i, LOG_QP, &SRV_DATA->ctrl_data->apply_offsets[i],
                         sizeof(uint64_t), IBDEV->lcl_mr[CTRL_QP],
                         IBV_WR_RDMA_READ, NOTSIGNALED, rm, NULL);
         if (0 != rc) {
@@ -1995,7 +1975,9 @@ int rc_get_remote_reads()
             error_return(RC_ERROR, log_fp, "Cannot post send operation\n");
         }        
     }
-    if (init) TIMER_STOP(log_fp);
+    if (init) {
+        TIMER_STOP(log_fp);
+    }
     
     return 0;
 }
@@ -2063,13 +2045,13 @@ int rc_disconnect_server( uint8_t idx )
     ep->ud_ep.ah = NULL;
     rc = rc_qp_reset(ep, LOG_QP);
     if (0 != rc) {
-        error_return(1, log_fp, "Cannot reset LOG QP for server %"PRIu8"\n", idx);
+        error_return(1, log_fp, "Cannot reset LOG QP for p%"PRIu8"\n", idx);
     }
     rc = rc_qp_reset(ep, CTRL_QP);
     if (0 != rc) {
-        error_return(1, log_fp, "Cannot reset CTRL QP for server %"PRIu8"\n", idx);
+        error_return(1, log_fp, "Cannot reset CTRL QP for p%"PRIu8"\n", idx);
     }
-text(log_fp, "DISCONNECTED server %"PRIu8"\n", idx);
+text(log_fp, "DISCONNECTED p%"PRIu8"\n", idx);
     //info_wtime(log_fp, " # Disconnect server: %lf (ms)\n", (ev_now(SRV_DATA->loop) - start_ts)*1000);
     return 0;
 }
@@ -2112,40 +2094,6 @@ int rc_connect_server( uint8_t idx, int qp_id )
     return 0;
 }
 
-/** 
- * Partially connect a certain QP with a server: RESET->INIT->RTR->RTS
- * Note: the ReceiveQueue is connected with RQ_PSN set to 0; hence, 
- * the server cannot receive any RDMA operation; however, the SendQueue 
- * is connected normally; hence, the server can send RDMA operations
- */
-static int 
-rc_connect_server_partially( uint8_t idx, int qp_id )
-{
-    int rc;
-    dare_ib_ep_t *ep = (dare_ib_ep_t*)SRV_DATA->config.servers[idx].ep;
-    if (!ep->rc_connected) {
-        return 0;
-    }
-    
-    rc = rc_qp_reset_to_init(ep, qp_id);;
-    if (0 != rc) {
-        error_return(1, log_fp, "Cannot move QP to init state\n");
-    }
-
-    uint64_t tmp_sid = SRV_DATA->cached_sid;
-    SRV_DATA->cached_sid = 0;
-    rc = rc_qp_init_to_rtr(ep, qp_id);
-    if (0 != rc) {
-        error_return(1, log_fp, "Cannot move QP to RTR state\n");
-    }
-    SRV_DATA->cached_sid = tmp_sid;
-    rc = rc_qp_rtr_to_rts(ep, qp_id);
-    if (0 != rc) {
-        error_return(1, log_fp, "Cannot move QP to RTS state\n");
-    }    
-    return 0;
-}
-
 /**
  * Revoke remote log access; that is, 
  * move all log QPs to RESET state: *->RESET
@@ -2166,58 +2114,86 @@ int rc_revoke_log_access()
             /* No RC data */
             continue;
         }
+        if (0 == ep->log_access) {
+            /* No LOG access */
+            continue;
+        }
         
         rc = rc_qp_reset(ep, LOG_QP);
         if (0 != rc) {
             error_return(1, log_fp, "Cannot revoke the access of LID=%"PRIu16"\n",
                          ep->ud_ep.lid);
         }
+        ep->log_access = 0;
     }
-    info_wtime(log_fp, "REVOKE log access\n");
+    info_wtime(log_fp, "[T%"PRIu64"] Revoked log access\n", 
+                        SID_GET_TERM(SRV_DATA->ctrl_data->sid));
     //debug(log_fp, "Log access revoked\n");
 
     return 0;
 }
 
 /**
- * Restore remote log access; that is, 
- * move all log QPs to RTS state: RESET->INIT->RTR->RTS
+ * Grant remote log access to the leader; that is, 
+ * move log QP to RTS state: RESET->INIT->RTR->RTS
  */
 int rc_restore_log_access()
 {
     int rc;
-    uint8_t i, size = get_extended_group_size(SRV_DATA->config);
+    uint8_t i, leader_idx, 
+            size = get_extended_group_size(SRV_DATA->config);
     dare_ib_ep_t *ep;
-    
-    for (i = 0; i < size; i++) {
-        if (i == SRV_DATA->config.idx) continue;
-        if (!CID_IS_SERVER_ON(SRV_DATA->config.cid, i)) {
-            continue;
+
+    leader_idx = SID_GET_IDX(SRV_DATA->ctrl_data->sid); 
+    if (leader_idx != SRV_DATA->config.idx) {
+        if (!CID_IS_SERVER_ON(SRV_DATA->config.cid, leader_idx)) {
+            error_return(1, log_fp, "Leader is OFF\n");
         }
-        ep = (dare_ib_ep_t*)SRV_DATA->config.servers[i].ep;
+        ep = (dare_ib_ep_t*)SRV_DATA->config.servers[leader_idx].ep;
         if (0 == ep->rc_connected) {
             /* No RC data */
-            continue;
+            error_return(1, log_fp, "Leader has not RC data\n");
         }
-
-        rc = rc_qp_reset(ep, LOG_QP);
-        if (0 != rc) {
-            error_return(1, log_fp, "Cannot move LOG QP to reset state\n");
+        if (1 == ep->log_access) {
+            /* Already LOG access */
+            info_wtime(log_fp, "[T%"PRIu64"] Already granted log access to p%"PRIu8"\n", 
+                                    SID_GET_TERM(SRV_DATA->ctrl_data->sid), 
+                                    SID_GET_IDX(SRV_DATA->ctrl_data->sid));
+            return 0;
         }
-        rc = rc_qp_reset_to_init(ep, LOG_QP);
-        if (0 != rc) {
-            error_return(1, log_fp, "Cannot move LOG QP to init state\n");
+        rc = rc_qp_reset_to_rts(ep, LOG_QP);
+        if (rc) {
+            error_return(1, log_fp, "rc_qp_reset_to_rts\n");
         }
-        rc = rc_qp_init_to_rtr(ep, LOG_QP);
-        if (0 != rc) {
-            error_return(1, log_fp, "Cannot move LOG QP to RTR state\n");
-        }
-        rc = rc_qp_rtr_to_rts(ep, LOG_QP);
-        if (0 != rc) {
-            error_return(1, log_fp, "Cannot move LOG QP to RTS state\n");
-        }
+        ep->log_access = 1;
+        info_wtime(log_fp, "[T%"PRIu64"] Granted log access to p%"PRIu8"\n", 
+                                    SID_GET_TERM(SRV_DATA->ctrl_data->sid), 
+                                    SID_GET_IDX(SRV_DATA->ctrl_data->sid));
     }
-    info_wtime(log_fp, "RESTORE log access T%"PRIu64"\n", SID_GET_TERM(SRV_DATA->cached_sid));
+    else if (SID_GET_L(SRV_DATA->ctrl_data->sid)) {
+        for (i = 0; i < size; i++) {
+            if (i == SRV_DATA->config.idx) continue;
+            if (!CID_IS_SERVER_ON(SRV_DATA->config.cid, i)) {
+                continue;
+            }
+            ep = (dare_ib_ep_t*)SRV_DATA->config.servers[i].ep;
+            if (0 == ep->rc_connected) {
+                /* No RC data */
+                continue;
+            }
+            if (1 == ep->log_access) {
+                /* Already LOG access */
+                continue;
+            }
+            rc = rc_qp_reset_to_rts(ep, LOG_QP);
+            if (rc) {
+                error_return(1, log_fp, "rc_qp_reset_to_rts\n");
+            }
+            ep->log_access = 1;
+        }
+        info_wtime(log_fp, "[T%"PRIu64"] Gained log access\n", 
+                                    SID_GET_TERM(SRV_DATA->ctrl_data->sid));
+    }
     //debug(log_fp, "Log access restored\n");
 
     return 0;
@@ -2292,11 +2268,13 @@ rc_qp_init_to_rtr( dare_ib_ep_t *ep, int qp_id )
 {
     int rc;
     struct ibv_qp_attr attr;
+#ifdef TERM_PSN    
     uint32_t psn;
     if (LOG_QP == qp_id) {
-        uint64_t term = SID_GET_TERM(SRV_DATA->cached_sid);
+        uint64_t term = SID_GET_TERM(SRV_DATA->ctrl_data->sid);
         psn = (uint32_t)(term & 0xFFFFFF);
     }
+#endif    
     //struct ibv_qp_init_attr init_attr;
     //uint8_t max_dest_rd_atomic;
     //ibv_query_qp(ep->rc_ep.rc_qp[qp_id].qp, &attr, IBV_QP_MAX_DEST_RD_ATOMIC, &init_attr);
@@ -2306,11 +2284,15 @@ rc_qp_init_to_rtr( dare_ib_ep_t *ep, int qp_id )
     memset(&attr, 0, sizeof(attr));
     attr.qp_state           = IBV_QPS_RTR;
     /* Setup attributes */
-    attr.path_mtu           = IBDEV->mtu;
+    attr.path_mtu           = ep->mtu;
     attr.max_dest_rd_atomic = IBDEV->ib_dev_attr.max_qp_rd_atom;
     attr.min_rnr_timer      = 12;
     attr.dest_qp_num        = ep->rc_ep.rc_qp[qp_id].qpn;
+#ifdef TERM_PSN    
     attr.rq_psn             = (LOG_QP == qp_id) ? psn : CTRL_PSN;
+#else    
+    attr.rq_psn             = (LOG_QP == qp_id) ? LOG_PSN : CTRL_PSN;
+#endif    
     /* Note: this needs to modified for the lock; see rc_log_qp_lock */
     attr.ah_attr.is_global     = 0;
     attr.ah_attr.dlid          = ep->ud_ep.lid;
@@ -2339,11 +2321,13 @@ rc_qp_rtr_to_rts( dare_ib_ep_t *ep, int qp_id )
 {
     int rc;
     struct ibv_qp_attr attr;
+#ifdef TERM_PSN    
     uint32_t psn;
     if (LOG_QP == qp_id) {
-        uint64_t term = SID_GET_TERM(SRV_DATA->cached_sid);
+        uint64_t term = SID_GET_TERM(SRV_DATA->ctrl_data->sid);
         psn = (uint32_t)(term & 0xFFFFFF);
     }
+#endif    
     //struct ibv_qp_init_attr init_attr;
     //ibv_query_qp(ep->rc_ep.rc_qp[qp_id].qp, &attr, IBV_QP_MAX_QP_RD_ATOMIC | IBV_QP_MAX_DEST_RD_ATOMIC, &init_attr);
     //info_wtime(log_fp, "RC QP[%s] max_rd_atomic=%"PRIu8"; max_dest_rd_atomic=%"PRIu8"\n", qp_id == LOG_QP ? "LOG" : "CTRL", attr.max_rd_atomic, attr.max_dest_rd_atomic);
@@ -2355,7 +2339,11 @@ rc_qp_rtr_to_rts( dare_ib_ep_t *ep, int qp_id )
     attr.timeout        = 1;    // ~ 8 us
     attr.retry_cnt      = 0;    // max is 7
     attr.rnr_retry      = 7;
+#ifdef TERM_PSN    
     attr.sq_psn         = (LOG_QP == qp_id) ? psn : CTRL_PSN;
+#else    
+    attr.sq_psn         = (LOG_QP == qp_id) ? LOG_PSN : CTRL_PSN;
+#endif    
 //debug(log_fp, "MY SQ PSN: %"PRIu32"\n", attr.sq_psn);
     attr.max_rd_atomic = IBDEV->ib_dev_attr.max_qp_rd_atom;
 
@@ -2375,6 +2363,24 @@ rc_qp_rtr_to_rts( dare_ib_ep_t *ep, int qp_id )
     //               qp_id==LOG_QP ? "log":"ctrl", ep->ud_ep.lid, attr.sq_psn);
     return 0;
 }
+
+static int 
+rc_qp_reset_to_rts(dare_ib_ep_t *ep, int qp_id)
+{
+    if (rc_qp_reset(ep, qp_id)) {
+        error_return(1, log_fp, "Cannot move LOG QP to reset state\n");
+    }
+    if (rc_qp_reset_to_init(ep, qp_id)) {
+        error_return(1, log_fp, "Cannot move QP to init state\n");
+    }
+    if (rc_qp_init_to_rtr(ep, qp_id)) {
+        error_return(1, log_fp, "Cannot move QP to RTR state\n");
+    }
+    if (rc_qp_rtr_to_rts(ep, qp_id)) {
+        error_return(1, log_fp, "Cannot move QP to RTS state\n");
+    }
+}
+
 
 int rc_print_qp_state( void *data )
 {
@@ -2441,7 +2447,7 @@ post_send( uint8_t server_id,
     
     if (RC_QP_BLOCKED == *qp_state_ptr) {
         /* This QP is blocked; need to wait for the signaled WR */
-        info_wtime(log_fp, "%s QP of #%"PRIu8" is BLOCKED\n", qp_id == LOG_QP ? "LOG": "CTRL", server_id);
+        info_wtime(log_fp, "%s QP of p%"PRIu8" is BLOCKED\n", qp_id == LOG_QP ? "LOG": "CTRL", server_id);
         rc = empty_completion_queue(server_id, qp_id, 1, NULL);
         if (0 != rc) {
             error_return(1, log_fp, "Cannot empty completion queue\n");
@@ -2457,8 +2463,7 @@ post_send( uint8_t server_id,
     
     /* Increment number of posted sends to avoid QP overflow */
     (*send_count_ptr)++;
-    //info_wtime(log_fp, "(ssn=%"PRIu64":%"PRIu8") send_count[%s] = %"PRIu32"\n", 
-    //    ssn, server_id, qp_id == LOG_QP ? "LOG" : "CTRL", *send_count_ptr);
+    //info_wtime(log_fp, "(ssn=%"PRIu64":p%"PRIu8") send_count[%s] = %"PRIu32"\n", ssn, server_id, qp_id == LOG_QP ? "LOG" : "CTRL", *send_count_ptr);
  
     /* Local memory */
     memset(&sg, 0, sizeof(sg));
@@ -2481,15 +2486,14 @@ post_send( uint8_t server_id,
     {
         /* Signaled WR was found */
         *signaled_wrid_ptr = 0;
-        //info_wtime(log_fp, "(signaled WR found) send_count[%s] = %"PRIu32"\n", 
-        //            qp_id == LOG_QP ? "LOG" : "CTRL", *send_count_ptr);
+        //info_wtime(log_fp, "(signaled WR found) send_count[%s] = %"PRIu32"\n", qp_id == LOG_QP ? "LOG" : "CTRL", *send_count_ptr);
     }
     if ( (*send_count_ptr == IBDEV->rc_max_send_wr >> 2) && (*signaled_wrid_ptr == 0) ) {
         /* A quarter of the Send Queue is full; add a special signaled WR */
         wr.send_flags |= IBV_SEND_SIGNALED;
         WRID_SET_TAG(wr.wr_id);    // special mark
         *signaled_wrid_ptr = wr.wr_id;
-        //info_wtime(log_fp, "Signaled WR added on QP %d for server #%"PRIu8" with ssn=%"PRIu64"\n", qp_id, server_id, WRID_GET_SSN(*signaled_wrid_ptr));
+        //info_wtime(log_fp, "Signaled WR added on QP %s for p%"PRIu8" with ssn=%"PRIu64"\n", qp_id == LOG_QP ? "LOG" : "CTRL", server_id, WRID_GET_SSN(*signaled_wrid_ptr));
         //info_wtime(log_fp, "SSN = %"PRIu64"\n", ssn);
         *send_count_ptr = 0;
     }
@@ -2497,8 +2501,7 @@ post_send( uint8_t server_id,
         if (*signaled_wrid_ptr != 0) {
             /* The Send Queue is full; need to wait for the signaled WR */
             wait_signaled_wr = 1;
-            //info_wtime(log_fp, "(waiting for signaled WR) send_count[%s] = %"PRIu32"\n", 
-            //            qp_id == LOG_QP ? "LOG" : "CTRL", *send_count_ptr);
+            //info_wtime(log_fp, "(waiting for signaled WR) send_count[%s] = %"PRIu32"\n", qp_id == LOG_QP ? "LOG" : "CTRL", *send_count_ptr);
             //info_wtime(log_fp, "waiting for:"); PRINT_WRID_(*signaled_wrid_ptr);
         }
     }
@@ -2555,7 +2558,6 @@ empty_completion_queue( uint8_t server_id,
         if (0 == ne) {
             /* ... but do not wait for them... */
             if (wait_signaled_wr) {
-                //info_wtime(log_fp, "waiting...\n");
                 /* ... unless if we are waiting for the special entry */
                 continue;
             }
@@ -2625,11 +2627,11 @@ empty_completion_queue( uint8_t server_id,
                 if (wr_id == *signaled_wrid_ptr) {
                     /* Special signaled WR found - untag it */
                     WRID_UNSET_TAG(*signaled_wrid_ptr);
-                    //info_wtime(log_fp, "Found signal for QP %d of server #%"PRIu8"\n", qp_id, conn);
+                    //info_wtime(log_fp, "Found signal for QP %d of p%"PRIu8"\n", qp_id, conn);
                     if (RC_QP_BLOCKED == *qp_state_ptr) {
                         /* Unblock QP */
                         *qp_state_ptr = RC_QP_ERROR;
-                        //info_wtime(log_fp, "Unblock QP %d of server #%"PRIu8"\n", qp_id, conn);
+                        //info_wtime(log_fp, "Unblock QP %d of p%"PRIu8"\n", qp_id, conn);
                     }
                     if (conn == server_id) {
                         /* This is the signaled WR we were waiting for */
@@ -2639,7 +2641,7 @@ empty_completion_queue( uint8_t server_id,
                 else {
                     /* This WR is from the same QP as a signaled WR; 
                     in case of error, we cannot restart the QP to not lose the signaled WR */
-                    //info_wtime(log_fp, "Cannot reset QP %d of server #%"PRIu8"; waiting for ssn=%"PRIu64"\n", qp_id, conn, WRID_GET_SSN(*signaled_wrid_ptr));
+                    //info_wtime(log_fp, "Cannot reset QP %d of p%"PRIu8"; waiting for ssn=%"PRIu64"\n", qp_id, conn, WRID_GET_SSN(*signaled_wrid_ptr));
                     //info_wtime(log_fp, "Current ssn=%"PRIu64"\n", WRID_GET_SSN(wr_id));
                     can_restart_qp = 0;
                 }
@@ -2655,11 +2657,11 @@ empty_completion_queue( uint8_t server_id,
                     /* Mark send as successful */
                     posted_sends[conn]--;
                 }
-                TIMER_INFO(log_fp, "      [+(#%"PRIu8",%"PRIu64")]\n", 
+                TIMER_INFO(log_fp, "      [+(p%"PRIu8",%"PRIu64")]\n", 
                             conn, WRID_GET_SSN(wr_id));            
             }
             else if (WC_FAILURE == rc) {
-                TIMER_INFO(log_fp, "      [-(#%"PRIu8",%"PRIu64")]\n", 
+                TIMER_INFO(log_fp, "      [-(p%"PRIu8",%"PRIu64")]\n", 
                         conn, WRID_GET_SSN(wr_id));  
                 if (can_restart_qp) {
                     /* Move QP into ERR state */
@@ -2670,7 +2672,7 @@ empty_completion_queue( uint8_t server_id,
                     however, we cannot post new WRs in this QP since it's in the ERR state*/
                     /* This if must be here !!! */
                     if (RC_QP_ERROR != ep->rc_ep.rc_qp[qp_id].state)  {
-                   // info_wtime(log_fp, "[%s:%d] Blocking QP %d of server #%"PRIu8"\n", 
+                   // info_wtime(log_fp, "[%s:%d] Blocking QP %d of p%"PRIu8"\n", 
                    //         __func__, __LINE__, qp_id, conn);
                         ep->rc_ep.rc_qp[qp_id].state = RC_QP_BLOCKED;
                     }
@@ -2829,7 +2831,7 @@ wait_for_majority( int *posted_sends, int qp_id )
                 if (WC_SUCCESS == rc) {
                     /* Successful send operation: reset failure count */
                     server->fail_count = 0;
-                    TIMER_INFO(log_fp, "      [+(#%"PRIu8",%"PRIu64")]\n",
+                    TIMER_INFO(log_fp, "      [+(p%"PRIu8",%"PRIu64")]\n",
                             conn, WRID_GET_SSN(wr_id));            
                     if (ssn > WRID_GET_SSN(wr_id)) {
                         /* Work completion from a previous posted sends */
@@ -2857,7 +2859,7 @@ wait_for_majority( int *posted_sends, int qp_id )
                         /* To not lose the signaled WR, we restart the QP later;
                         however, we cannot post new WRs in this QP since it's in the ERR state*/
                         if (RC_QP_ERROR != ep->rc_ep.rc_qp[qp_id].state) {
-                            //info_wtime(log_fp, "[%s:%d] Blocking QP %d of server #%"PRIu8"\n", __func__, __LINE__, qp_id, conn);
+                            //info_wtime(log_fp, "[%s:%d] Blocking QP %d of p%"PRIu8"\n", __func__, __LINE__, qp_id, conn);
                             ep->rc_ep.rc_qp[qp_id].state = RC_QP_BLOCKED;
                         }
                     }
@@ -2866,7 +2868,7 @@ wait_for_majority( int *posted_sends, int qp_id )
                     if (CTRL_QP == qp_id) {
                         server->fail_count++;
                     }
-                    TIMER_INFO(log_fp, "       [-(#%"PRIu8",%"PRIu64")]\n",
+                    TIMER_INFO(log_fp, "       [-(p%"PRIu8",%"PRIu64")]\n",
                             conn, WRID_GET_SSN(wr_id));
                     continue;
                 }
@@ -3013,7 +3015,7 @@ wait_for_one( int *posted_sends, int qp_id )
                     posted_sends[conn]--;
                     success_count++;
                 }
-                TIMER_INFO(log_fp, "      [+(#%"PRIu8",%"PRIu64")]\n", 
+                TIMER_INFO(log_fp, "      [+(p%"PRIu8",%"PRIu64")]\n", 
                            conn, WRID_GET_SSN(wr_id));            
                 continue;
             }
@@ -3028,7 +3030,7 @@ wait_for_one( int *posted_sends, int qp_id )
                     /* To not lose the signaled WR, we restart the QP later;
                     however, we cannot post new WRs in this QP since it's in the ERR state*/
                     if (RC_QP_ERROR != ep->rc_ep.rc_qp[qp_id].state)  {
-  //                  info_wtime(log_fp, "[%s:%d] Blocking QP %d of server #%"PRIu8"\n", 
+  //                  info_wtime(log_fp, "[%s:%d] Blocking QP %d of p%"PRIu8"\n", 
   //                          __func__, __LINE__, qp_id, conn);
                         ep->rc_ep.rc_qp[qp_id].state = RC_QP_BLOCKED;
                     }
@@ -3037,7 +3039,7 @@ wait_for_one( int *posted_sends, int qp_id )
                 if (CTRL_QP == qp_id) {
                     server->fail_count++;
                 }
-                TIMER_INFO(log_fp, "      [-(#%"PRIu8",%"PRIu64")]\n",  
+                TIMER_INFO(log_fp, "      [-(p%"PRIu8",%"PRIu64")]\n",  
                            conn, WRID_GET_SSN(wr_id));
                 continue;
             }
@@ -3069,7 +3071,7 @@ handle_lr_work_completion( uint8_t idx, int wc_rc )
     idx = WRID_GET_CONN(wr_id);
     server_t *server = &SRV_DATA->config.servers[idx];
     
-//info_wtime(log_fp, "lr_work_completion: #%"PRIu8"\n", idx);
+//info_wtime(log_fp, "lr_work_completion: p%"PRIu8"\n", idx);
     if (wr_id == server->next_wr_id) {
         if (WC_SUCCESS == wc_rc) {        
             if (server->next_lr_step == LR_UPDATE_LOG) {
@@ -3082,7 +3084,7 @@ handle_lr_work_completion( uint8_t idx, int wc_rc )
                     case 1:
                         /* The log was updated successfully */
                         server->next_lr_step = LR_UPDATE_END;
-//TIMER_INFO(log_fp, "[#%"PRIu8"->log(:%"PRIu64")]\n", idx, server->cached_end_offset);
+//TIMER_INFO(log_fp, "[p%"PRIu8"->log(:%"PRIu64")]\n", idx, server->cached_end_offset);
                         server->send_flag = 1;
                         break;
                     case 2:
@@ -3094,13 +3096,13 @@ handle_lr_work_completion( uint8_t idx, int wc_rc )
             else if (server->next_lr_step != LR_UPDATE_END) {
                 /* Current LR step succeeded */
                 server->next_lr_step++;
-//TIMER_INFO(log_fp, "[#%"PRIu8"->S%"PRIu8"(e=%"PRIu64")]\n", idx, server->next_lr_step, SRV_DATA->ctrl_data->log_offsets[idx].end);
+//TIMER_INFO(log_fp, "[p%"PRIu8"->S%"PRIu8"(e=%"PRIu64")]\n", idx, server->next_lr_step, SRV_DATA->ctrl_data->log_offsets[idx].end);
                 server->send_flag = 1;
             }
             else {
                 /* Successful end offset update */
                 server->next_lr_step = LR_UPDATE_LOG;
-//TIMER_INFO(log_fp, "[#%"PRIu8"->e=%"PRIu64"]\n", idx, SRV_DATA->ctrl_data->log_offsets[idx].end);
+//TIMER_INFO(log_fp, "[p%"PRIu8"->e=%"PRIu64"]\n", idx, SRV_DATA->ctrl_data->log_offsets[idx].end);
                 server->send_flag = 1;
             }
         }
@@ -3174,7 +3176,7 @@ handle_work_completion( struct ibv_wc *wc, int qp_id )
             process or outstanding when the QP transitioned into the 
             Error State. */
             text(log_fp, "\nIBV_WC_WR_FLUSH_ERR\n");  
-            //info_wtime(log_fp, "IBV_WC_WR_FLUSH_ERR on server (#%"PRIu8") %s QP\n", wr_idx, qp_id == LOG_QP ? "LOG" : "CTRL"); 
+            //info_wtime(log_fp, "IBV_WC_WR_FLUSH_ERR on p%"PRIu8" %s QP\n", wr_idx, qp_id == LOG_QP ? "LOG" : "CTRL"); 
             rc = WC_FAILURE;
             /* The local QP moves into ERR state - restart it */
             //rc_qp_restart(ep, qp_id);
@@ -3215,7 +3217,7 @@ handle_work_completion( struct ibv_wc *wc, int qp_id )
             means that the remote QP isn’t available anymore. */
             /* REMOTE SIDE IS DOWN */
             text(log_fp, "\nIBV_WC_RETRY_EXC_ERR\n"); 
-            info_wtime(log_fp, "IBV_WC_RETRY_EXC_ERR on server (#%"PRIu8") %s QP\n", wr_idx, qp_id == LOG_QP ? "LOG" : "CTRL"); 
+            info_wtime(log_fp, "IBV_WC_RETRY_EXC_ERR on p%"PRIu8" %s QP\n", wr_idx, qp_id == LOG_QP ? "LOG" : "CTRL"); 
             rc = WC_FAILURE;
             /* The local QP moves into ERR state - restart it */
             //rc_qp_restart(ep, qp_id);

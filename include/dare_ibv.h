@@ -37,6 +37,7 @@
    (state == IBV_QPS_ERR) ? "ERR" : "X")
 
 #define CTRL_PSN 13
+#define LOG_PSN 55
 #define LOG_QP 1
 #define CTRL_QP 0
 
@@ -79,7 +80,9 @@ typedef struct rc_ep_t rc_ep_t;
 struct dare_ib_ep_t {
     ud_ep_t ud_ep;  // UD info
     rc_ep_t rc_ep;  // RC info
+    uint32_t mtu;
     int rc_connected;
+    int log_access;
 };
 typedef struct dare_ib_ep_t dare_ib_ep_t;
 
@@ -90,7 +93,7 @@ struct dare_ib_device_t {
     struct ibv_device_attr ib_dev_attr;
     uint16_t pkey_index;    
     uint8_t port_num;       // port number 
-    uint32_t mtu;           // MTU for this device
+    enum ibv_mtu mtu;       // MTU for this device
     uint16_t lid;           // local ID for this device        
 
     /* QP for listening for clients requests - UD */
@@ -164,7 +167,7 @@ int dare_ib_send_vote_ack();
 /* Normal operation */
 int dare_ib_establish_leadership();
 int dare_ib_write_remote_logs( int wait_for_commit );
-int dare_ib_get_remote_reads();
+int dare_ib_get_remote_apply_offsets();
 
 /* Handle client requests */
 int dare_ib_apply_cmd_locally();

@@ -1,14 +1,17 @@
 #!/bin/bash
 #
+# Copyright (c) 2016 HLRS, University of Stuttgart. All rights reserved.
+#
 # Copyright (c) 2014-2015 ETH-Zurich. All rights reserved.
 #
 # Author(s): Marius Poke <marius.poke@inf.ethz.ch>
 #
 
+
 define(){ IFS='\n' read -r -d '' ${1} || true; }
 
 define HELP <<'EOF'
-Script for building REACH
+Script for building DARE
 usage  : $0 [options]
 options: [--prefix=DIR]                # Installation directory
          [--with-ev=DIR]               # libev installation directory
@@ -74,6 +77,8 @@ do
         ;;
   esac
 done
+
+echo "$0 $@" > config.log
 
 if [[ "x$EVDIR" == "x" ]]; then
     ErrorAndExit "No libev installation directory defined: --with-ev."

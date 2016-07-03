@@ -280,7 +280,7 @@ init_network_cb( EV_P_ ev_timer *w, int revents )
         kvs_cmd_t kvs_cmd;
         fread(&kvs_cmd, sizeof(kvs_cmd_t), 1, data.trace_fp);
         second_op_fp = kvs_cmd.len + sizeof(kvs_cmd_t) + 1;
-        info_wtime(log_fp, "%ld,%ld\n", first_op_fp, second_op_fp);
+        //info_wtime(log_fp, "%ld,%ld\n", first_op_fp, second_op_fp);
         /* Reset file pointer */
         rc = fseek(data.trace_fp, first_op_fp, SEEK_SET);
         srand (time(NULL));

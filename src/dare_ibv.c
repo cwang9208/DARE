@@ -228,9 +228,9 @@ init_one_device( struct ibv_device* ib_dev )
                 break;
             }
         }
-        //device->mtu = ib_port_attr.max_mtu;
+        device->mtu = ib_port_attr.max_mtu;
         //device->mtu = ib_port_attr.active_mtu;
-        device->mtu = IBV_MTU_4096;
+        //device->mtu = IBV_MTU_2048;
         info(log_fp, "# ib_port_attr.active_mtu = %"PRIu32" (%d bytes)\n", 
              ib_port_attr.active_mtu, mtu_value(ib_port_attr.active_mtu));
         info(log_fp, "# device->mtu = %"PRIu32" (%d bytes)\n", 
@@ -445,11 +445,11 @@ int dare_ib_write_remote_logs( int wait_for_commit )
 }
 
 /**
- * Get remote read offsets
+ * Get remote apply offsets
  */
-int dare_ib_get_remote_reads()
+int dare_ib_get_remote_apply_offsets()
 {
-    return rc_get_remote_reads();
+    return rc_get_remote_apply_offsets();
 }
 
 #endif 

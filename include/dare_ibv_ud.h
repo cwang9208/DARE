@@ -3,9 +3,12 @@
  * 
  * Unreliable Datagrams (UD) over InfiniBand
  *
+ * Copyright (c) 2016 HLRS, University of Stuttgart. All rights reserved.
+ * 
  * Copyright (c) 2014-2015 ETH-Zurich. All rights reserved.
  * 
  * Author(s): Marius Poke <marius.poke@inf.ethz.ch>
+ *            Nakul Vyas <mailnakul@gmail.com>
  * 
  */
  
@@ -22,7 +25,6 @@
 
 /* ================================================================== */
 /* UD messages */
-
 struct ud_hdr_t {
     uint64_t id;
     uint8_t type;
@@ -61,6 +63,7 @@ struct rc_syn_t {
     ud_hdr_t hdr;
     rem_mem_t log_rm;
     rem_mem_t ctrl_rm;
+    enum ibv_mtu mtu;
     uint8_t idx;
     uint8_t size;
     uint8_t data[0];    // log & ctrl QPNs
@@ -72,6 +75,8 @@ struct rc_ack_t {
 	uint8_t idx;
 };
 typedef struct rc_ack_t rc_ack_t;
+
+extern char* global_mgid; 
 
 /* ================================================================== */ 
 
