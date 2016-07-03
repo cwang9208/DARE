@@ -1,0 +1,8 @@
+
+
+mckey program is used to test RDMA CM multicast setup and simple data transfer.
+usage  : mckey [options]
+options: -m       # multicast_address
+         -s       # sender
+
+
