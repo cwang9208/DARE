@@ -2558,7 +2558,7 @@ empty_completion_queue( uint8_t server_id,
         if (0 == ne) {
             /* ... but do not wait for them... */
             if (wait_signaled_wr) {
-                /* ... unless if we are waiting for the special entry */
+                /* ... unless the send queue is full; need to wait for the signaled WR */
                 continue;
             }
             break;
