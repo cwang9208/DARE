@@ -417,6 +417,9 @@ ud_qp_create()
     
     /* Attach the QP to a multicast group */
     // saquery -g
+    // Usage: saquery [options] [query-name] [<name> | <lid> | <guid>]
+    // Options:
+    //   -g get multicast group info   
     
     uint8_t raw[16]; 
     if (!global_mgid) {
