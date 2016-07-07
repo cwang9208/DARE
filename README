@@ -6,8 +6,8 @@ Brief: A wait-free direct access protocol that uses RDMA features such as QP dis
 Build DARE
 ----------
 1. Prerequisites
-    - libev
-    - libibverbs
+    - libev (version >= 4.15)
+    - libibverbs (version >= 1.0.0)
 2. ./configure --help
 Script for building DARE
 usage  : $0 [options]
