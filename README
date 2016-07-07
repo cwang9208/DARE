@@ -6,7 +6,7 @@ Brief: A wait-free direct access protocol that uses RDMA features such as QP dis
 Build DARE
 ----------
 1. Prerequisites
-    - libev (apt-get install libev-dev)
+    - libev
     - libibverbs
 2. ./configure --help
 Script for building DARE
