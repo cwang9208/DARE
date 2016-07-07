@@ -1,5 +1,8 @@
 
 1. tar -zxvf libev-4.15.tar.gz
-2. step inside the directory and run the following sequence of commands: ./configure; make; make install.
-   Libraries have been installed in: /usr/local/lib
+2. ./configure
+3. make
+4. make install
+
+Libraries have been installed in: /usr/local/lib
 
