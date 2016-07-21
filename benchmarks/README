@@ -5,5 +5,8 @@ usage  : mckey [options]
 options: -m       # multicast_address
          -s       # sender
          -b       # bind_address
+         
+Server: $ mckey -m 225.1.1.1 -b 10.22.1.1
+Client: $ mckey -m 225.1.1.1 -b 10.22.1.2 -s
 
 
