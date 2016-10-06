@@ -12,9 +12,10 @@ Build DARE
 Script for building DARE
 usage  : $0 [options]
 options: [--prefix=DIR]                # Installation directory
-         [--with-ev=DIR]               # libev installation directory: /usr/local/
+         [--with-ev=DIR]               # libev installation directory: libev.a
          [--with-ibv=DIR]              # libibverbs installation directory
 3. make
+CFLAGS = -Wl,--no-as-needed#-Wall -Wunused-function #-Wextra
 
 Running benchmarks (from [1])
 -----------------------------
