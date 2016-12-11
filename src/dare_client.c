@@ -379,7 +379,7 @@ output_cb( EV_P_ ev_timer *w, int revents )
                 output_time, last_request_count, request_count);
     }
     output_time += CLT_OUTPUT_PERIOD;
-    fprintf(data.output_fp, "%"PRIu64" %"PRIu64" %lf\n", output_time, request_count, ev_now(EV_A));
+    fprintf(data.output_fp, "output time: %"PRIu64"ms, request count: %"PRIu64", %lf\n", output_time, request_count, ev_now(EV_A));
     last_request_count = request_count;
     request_count = 0;
 }
