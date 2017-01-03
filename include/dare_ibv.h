@@ -29,6 +29,24 @@
     (mtu == IBV_MTU_2048) ? 2048 :  \
     (mtu == IBV_MTU_4096) ? 4096 : 0)
 
+enum ctx_device {
+    DEVICE_ERROR        = -1,
+    UNKNOWN         = 0,
+    CONNECTX        = 1,
+    CONNECTX2       = 2,
+    CONNECTX3       = 3,
+    CONNECTIB       = 4,
+    LEGACY          = 5,
+    CHELSIO_T4      = 6,
+    CHELSIO_T5      = 7,
+    CONNECTX3_PRO       = 8,
+    SKYHAWK         = 9,
+    CONNECTX4       = 10,
+    CONNECTX4LX     = 11,
+    QLOGIC_E4       = 12,
+    QLOGIC_AH       = 13
+};
+
 #define qp_state_to_str(state) \
    ((state == IBV_QPS_RESET) ? "RESET" : \
    (state == IBV_QPS_INIT) ? "INIT" : \
