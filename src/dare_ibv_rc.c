@@ -2284,7 +2284,10 @@ rc_qp_init_to_rtr( dare_ib_ep_t *ep, int qp_id )
     memset(&attr, 0, sizeof(attr));
     attr.qp_state           = IBV_QPS_RTR;
     /* Setup attributes */
+    /* when the data payload of the message is greater than path_mtu 
+     * transport will segment into multiple packets */
     attr.path_mtu           = ep->mtu;
+    
     attr.max_dest_rd_atomic = IBDEV->ib_dev_attr.max_qp_rd_atom;
     attr.min_rnr_timer      = 12;
     attr.dest_qp_num        = ep->rc_ep.rc_qp[qp_id].qpn;
