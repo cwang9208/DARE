@@ -228,8 +228,8 @@ init_one_device( struct ibv_device* ib_dev )
                 break;
             }
         }
-        device->mtu = ib_port_attr.max_mtu;
-        //device->mtu = ib_port_attr.active_mtu;
+        //device->mtu = ib_port_attr.max_mtu;
+        device->mtu = ib_port_attr.active_mtu;
         //device->mtu = IBV_MTU_2048;
         info(log_fp, "# ib_port_attr.active_mtu = %"PRIu32" (%d bytes)\n", 
              ib_port_attr.active_mtu, mtu_value(ib_port_attr.active_mtu));

@@ -841,7 +841,7 @@ get_message:
         if ( (CSM_WRITE == type) && (CSM_WRITE == prev_type) ) {
             /* Write request; gather more */
             rd_wr_count++;
-            //if (4 == rd_wr_count) goto handle_messages; // exceed MTU size
+            //if (4 == rd_wr_count) goto handle_messages; // limit the size of a batch
             goto get_message;
         }
     }
