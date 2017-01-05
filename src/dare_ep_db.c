@@ -153,7 +153,7 @@ void ep_dp_reply_read_req( struct rb_root *root, uint64_t idx )
             }
             verify_leadership = 1;
         }
-        if (ep->wait_for_idx <= idx) {
+        if (ep->wait_for_idx <= idx) { // bug fixed
             ud_clt_answer_read_request(ep);
         }
     }
