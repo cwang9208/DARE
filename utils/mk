@@ -1,0 +1,33 @@
+#! /bin/bash
+#build dep for the program
+
+CUR_DIR=$(pwd)
+LIB_PREFIX=${CUR_DIR}/.local/
+
+mkdir -p ${LIB_PREFIX}
+
+LIBEV_VER=4.15
+LIBEV_NAME=libev-${LIBEV_VER}
+
+if [ ! -d "dep-lib" ];then
+# True if dep-lib exists and is a directory.
+    mkdir dep-lib
+fi
+cd dep-lib
+
+if [ ! -f "${LIBEV_NAME}.tar.gz" ];then
+    wget http://dist.schmorp.de/libev/Attic/{LIBEV_NAME}.tar.gz
+fi
+
+if [ ! -d "${LIBEV_NAME}" ];then
+    tar -xvf ${LIBEV_NAME}.tar.gz
+fi
+
+cd ${LIBEV_NAME}
+pwd
+./configure --prefix=${LIB_PREFIX}
+make;
+make install;
+cd ..
+
+cd ..
