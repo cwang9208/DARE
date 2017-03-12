@@ -104,7 +104,16 @@ $(RESIZE_TRACE): $(RESIZE_TRACE_OBJS) $(HEADERS) $(DARE)
 	@echo
 trace_print:
 	@echo "##### BUILDING Trace Generators #####"
-		
+
+# Conditional inclusion can be used to include debugging code with something like
+# #ifdef DEBUG
+#	  printf();
+# #endif
+# To achieve such conditional debug statements, you can either add the line
+# #define DEBUG
+# at the beginning of the source code or compile the source code with
+# gcc -DDEBUG file
+# The flag -D stands for define
 debug: FLAGS += -DDEBUG -g -O0
 debug: dare test trace
 
